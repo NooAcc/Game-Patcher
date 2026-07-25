@@ -13,9 +13,9 @@ jobs:
   test:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version: "1.25"
           cache: true
@@ -33,7 +33,7 @@ jobs:
 
       - name: Upload snapshot binaries
         if: github.event_name == 'push'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: game-patcher-${{ github.sha }}
           path: build/*.exe
