@@ -1,0 +1,6 @@
+/build/
+*.exe
+/cli
+/restorer
+/game-patcher-*
+/upgrader
