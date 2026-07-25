@@ -30,3 +30,12 @@ jobs:
           go build -ldflags="-s -w" -o build/game-patcher-cli-win64.exe ./cmd/cli/
           go build -ldflags="-s -w" -o build/game-patcher-upgrader-win64.exe ./cmd/upgrader/
           go build -ldflags="-s -w" -o build/restorer-win64.exe ./cmd/restorer/
+
+      - name: Upload snapshot binaries
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: game-patcher-${{ github.sha }}
+          path: build/*.exe
+          if-no-files-found: error
+          retention-days: 7
