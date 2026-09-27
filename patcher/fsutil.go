@@ -106,3 +106,12 @@ func cleanupEmptyDirs(dir, stopAt string) {
 func fitsInt(n uint64) bool {
 	return n <= uint64(^uint(0)>>1)
 }
+
+// Pause 等待用户按回车，避免双击运行时控制台窗口立即关闭。
+// 标准输入已结束（管道/CI/重定向）时立即返回，不会阻塞。
+func Pause() {
+	fmt.Println()
+	fmt.Println("按回车键退出...")
+	var b [1]byte
+	_, _ = os.Stdin.Read(b[:])
+}

@@ -28,10 +28,8 @@ type treeJob struct {
 	newMeta fileMeta
 }
 
-// CreatePatch 对比 oldPath 与 newPath，生成单文件升级工具。
-// oldPath/newPath 同为文件时生成单文件补丁，同为目录时生成目录树补丁。
-// target 仅在单文件模式下使用；为空时取 newPath 的文件名。
-func CreatePatch(baseExe, oldPath, newPath, outputPath, target, restorerPath string) error {
+// CreatePatch 对比两个版本目录，生成单文件升级工具。
+func CreatePatch(baseExe, oldPath, newPath, outputPath, restorerPath string) error {
 	start := time.Now()
 
 	oldInfo, err := os.Stat(oldPath)
@@ -42,16 +40,11 @@ func CreatePatch(baseExe, oldPath, newPath, outputPath, target, restorerPath str
 	if err != nil {
 		return fmt.Errorf("新版本路径无效: %w", err)
 	}
-	if oldInfo.IsDir() != newInfo.IsDir() {
-		return fmt.Errorf("-old 与 -new 必须同为文件或同为目录")
+	if !oldInfo.IsDir() || !newInfo.IsDir() {
+		return fmt.Errorf("仅支持目录模式：-old 与 -new 必须都是文件夹")
 	}
 
-	var patch *Patch
-	if newInfo.IsDir() {
-		patch, err = buildTreePatch(oldPath, newPath, outputPath)
-	} else {
-		patch, err = buildFilePatch(oldPath, newPath, target)
-	}
+	patch, err := buildTreePatch(oldPath, newPath, outputPath)
 	if err != nil {
 		return err
 	}
@@ -76,32 +69,6 @@ func CreatePatch(baseExe, oldPath, newPath, outputPath, target, restorerPath str
 	fmt.Println()
 	fmt.Println("💡 将此文件放入游戏目标目录，直接运行即可升级。")
 	return nil
-}
-
-func buildFilePatch(oldFile, newFile, target string) (*Patch, error) {
-	if target == "" {
-		target = filepath.Base(newFile)
-	}
-	target = filepath.ToSlash(target)
-	if err := validateRelPath(target); err != nil {
-		return nil, fmt.Errorf("目标路径非法: %w", err)
-	}
-
-	fmt.Println("🔍 计算二进制差异...")
-	res, err := buildDelta(oldFile, newFile)
-	if err != nil {
-		return nil, err
-	}
-	entry := Entry{
-		Path:    target,
-		Action:  ActionUpdate,
-		OldHash: res.OldHash,
-		NewHash: res.NewHash,
-		OldSize: res.OldSize,
-		NewSize: res.NewSize,
-		Ops:     res.Ops,
-	}
-	return &Patch{Mode: ModeFile, Entries: []Entry{entry}}, nil
 }
 
 func buildTreePatch(oldDir, newDir, skipPath string) (*Patch, error) {
@@ -147,7 +114,7 @@ func buildTreePatch(oldDir, newDir, skipPath string) (*Patch, error) {
 	}
 	fmt.Printf("\n📊 差异: +%d 新增, ~%d 修改, -%d 删除\n\n", adds, updates, dels)
 	if len(jobs) == 0 {
-		return &Patch{Mode: ModeTree}, nil
+		return &Patch{}, nil
 	}
 
 	entries := make([]Entry, len(jobs))
@@ -196,7 +163,7 @@ func buildTreePatch(oldDir, newDir, skipPath string) (*Patch, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Patch{Mode: ModeTree, Entries: entries}, nil
+	return &Patch{Entries: entries}, nil
 }
 
 func scanTree(root, skipPath string) (map[string]fileMeta, error) {
@@ -625,9 +592,6 @@ func printPatchSummary(gameDir string, patch *Patch) {
 	fmt.Println()
 	fmt.Printf("📂 目标目录: %s\n", gameDir)
 	fmt.Printf("📊 变更: +%d 新增, ~%d 修改, -%d 删除 (共 %d 项)\n", adds, updates, dels, len(patch.Entries))
-	if patch.Mode == ModeFile && len(patch.Entries) == 1 {
-		fmt.Printf("🎯 目标文件: %s\n", patch.Entries[0].Path)
-	}
 	fmt.Println()
 }
 
@@ -676,7 +640,7 @@ func backupAndVerify(gameDir, backupDir string, patch *Patch) (*RestoreManifest,
 		switch e.Action {
 		case ActionAdd:
 			if _, err := os.Stat(target); err == nil {
-				return nil, fmt.Errorf("目标文件已存在，无法安全新增: %s（补丁可能已应用）", e.Path)
+				return nil, fmt.Errorf("%s 文件已存在，游戏版本不一致（补丁可能已应用）", e.Path)
 			} else if !os.IsNotExist(err) {
 				return nil, err
 			}
@@ -684,10 +648,13 @@ func backupAndVerify(gameDir, backupDir string, patch *Patch) (*RestoreManifest,
 		case ActionUpdate, ActionDelete:
 			got, err := HashFile(target)
 			if err != nil {
+				if os.IsNotExist(err) {
+					return nil, fmt.Errorf("%s 文件不存在，游戏版本不一致", e.Path)
+				}
 				return nil, fmt.Errorf("读取目标文件失败 %s: %w", e.Path, err)
 			}
 			if got != e.OldHash {
-				return nil, fmt.Errorf("目标文件与补丁源版本不匹配: %s", e.Path)
+				return nil, fmt.Errorf("%s 文件被修改，游戏版本不一致", e.Path)
 			}
 			backupPath, err := SafeJoin(backupDir, e.Path)
 			if err != nil {

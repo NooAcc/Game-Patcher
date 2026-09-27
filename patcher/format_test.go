@@ -6,11 +6,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func samplePatch() *Patch {
 	return &Patch{
-		Mode: ModeTree,
 		Entries: []Entry{
 			{
 				Path: "dir/a.bin", Action: ActionUpdate,
@@ -36,7 +36,7 @@ func TestPatchEncodeDecodeRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Mode != p.Mode || len(got.Entries) != len(p.Entries) {
+	if len(got.Entries) != len(p.Entries) {
 		t.Fatalf("解码结果不一致: %+v", got)
 	}
 	for i := range p.Entries {
@@ -91,7 +91,7 @@ func TestDecodePatchRejectsBadMagicAndVersion(t *testing.T) {
 }
 
 func TestEncodeRejectsUnsafePath(t *testing.T) {
-	p := &Patch{Mode: ModeFile, Entries: []Entry{{Path: "../evil.txt", Action: ActionUpdate}}}
+	p := &Patch{Entries: []Entry{{Path: "../evil.txt", Action: ActionUpdate}}}
 	if _, err := p.Encode(); err == nil {
 		t.Fatal("路径穿越应被拒绝")
 	}
@@ -101,7 +101,6 @@ func TestDecodePatchRejectsHugeCounts(t *testing.T) {
 	var b bytes.Buffer
 	b.WriteString(patchMagic)
 	b.WriteByte(patchVersion)
-	b.WriteByte(byte(ModeTree))
 	putU32(&b, 0xFFFFFFFF)
 	if _, err := DecodePatch(b.Bytes()); err == nil {
 		t.Fatal("超大条目数应被拒绝")
@@ -171,5 +170,32 @@ func TestFormatSize(t *testing.T) {
 	}
 	if !strings.Contains(FormatSize(3<<30), "GB") {
 		t.Fatal("GB 格式化错误")
+	}
+}
+
+func TestPauseReturnsOnClosedStdin(t *testing.T) {
+	oldStdin := os.Stdin
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	os.Stdin = r
+	t.Cleanup(func() {
+		os.Stdin = oldStdin
+		r.Close()
+	})
+
+	done := make(chan struct{})
+	go func() {
+		Pause()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Pause 在标准输入关闭时未返回")
 	}
 }
