@@ -15,6 +15,8 @@
 
 ## 实测效果
 
+以 `test/` 中一对真实 `app.asar`（作为游戏目录内的一个变化文件）为基准：
+
 | 项目 | 数值 |
 | --- | --- |
 | 旧 `app.asar` | 320,966,965 B（约 306 MB） |
@@ -43,19 +45,7 @@ make test-short
 
 ### 生成升级工具
 
-**单文件模式**（例如更新 `app.asar`）：
-
-```bash
-game-patcher-cli-win64.exe -old ./app.asar.orig -new ./app.asar -out ./game-updater.exe
-```
-
-默认目标相对路径取 `-new` 的文件名（这里是 `app.asar`），可用 `-target` 覆盖：
-
-```bash
-game-patcher-cli-win64.exe -old ./old/app.asar -new ./new/app.asar -target resources/app.asar
-```
-
-**目录模式**（对比两个版本目录）：
+`-old` 与 `-new` 必须是两个版本的游戏目录：
 
 ```bash
 game-patcher-cli-win64.exe -old ./v1.0 -new ./v1.1 -out ./game-updater.exe
@@ -71,11 +61,11 @@ game-patcher-cli-win64.exe -shell
 > `restorer-win64.exe` 作为恢复工具。默认在 CLI 同目录自动查找，也可用
 > `-upgrader` / `-restorer` 显式指定。
 
-把生成的升级工具放到**目标目录**（单文件模式：目标文件所在目录；目录模式：游戏根目录），直接运行即可。
+把生成的升级工具放到**游戏根目录**，直接运行即可。
 
 ## 升级流程
 
-1. 从自身尾部读取并解析 `GPBIN2` 补丁数据；
+1. 从自身尾部读取并解析 `GPBIN3` 补丁数据；
 2. 显示变更统计，请求确认；
 3. 校验每个 update/delete 目标文件的 BLAKE3 与补丁记录的旧哈希一致，不一致立即中止；
 4. 把旧文件备份到 `_backup_before_patch/`，写入 `restore.json`，释放恢复工具；
@@ -96,7 +86,7 @@ restorer.exe
 - `add` → 删除升级时新增的文件；
 - `update` / `delete` → 从备份恢复，并校验恢复后的 BLAKE3 与升级前一致。
 
-## 二进制补丁格式（GPBIN2）
+## 二进制补丁格式（GPBIN3）
 
 生成的升级工具是：
 
@@ -104,19 +94,18 @@ restorer.exe
 ┌────────────────────────────────────────────┐
 │  upgrader 基础 EXE                          │
 ├────────────────────────────────────────────┤
-│  GPBIN2 补丁块                              │
-│    "GPBIN2"       6B                        │
-│    version        1B (=2)                   │
-│    mode           1B (1=单文件 2=目录)       │
+│  GPBIN3 补丁块                              │
+│    "GPBIN3"       6B                        │
+│    version        1B (=3)                   │
 │    entryCount     uint32 LE                 │
 │    Entry[]                                  │
 ├────────────────────────────────────────────┤
 │  patchLen         uint64 LE                 │
-│  "GPBIN2END!"     10B                       │
+│  "GPBIN3END!"     10B                       │
 ├────────────────────────────────────────────┤
 │  [可选] restorer 二进制                      │
 │  restorerLen      uint64 LE                 │
-│  "GPBIN2RST!"     10B                       │
+│  "GPBIN3RST!"     10B                       │
 └────────────────────────────────────────────┘
 ```
 
@@ -156,7 +145,7 @@ Op[]
 │   ├── upgrader/     # 升级工具模板
 │   └── restorer/     # 恢复工具
 ├── patcher/
-│   ├── format.go     # GPBIN2 格式、边界安全编解码
+│   ├── format.go     # GPBIN3 格式、边界安全编解码
 │   ├── delta.go      # CDC 分块、差异构建与应用
 │   ├── patch.go      # 打包、尾部定位、备份、升级
 │   ├── restore.go    # 恢复清单与回滚
@@ -178,8 +167,9 @@ go test ./...          # 含 test/app.asar(.orig) 的真实集成与端到端 EX
 
 ## 兼容性
 
-- 当前版本仅支持 `GPBIN2` 格式。
-- **不兼容**旧的 `GAMEPATCH1` 产物；旧补丁与旧恢复清单均不再支持。
+- 当前版本仅支持 `GPBIN3` 目录树补丁格式。
+- **不兼容**旧的 `GPBIN2`（含已移除的单文件模式）与 `GAMEPATCH1` 产物；旧补丁与旧恢复清单均不再支持。
+- 已移除单文件补丁生成模式：`-old` / `-new` 必须是目录。
 - Windows 上运行中的升级工具不能作为目标文件本身被替换。
 
 ## 技术栈

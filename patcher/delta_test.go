@@ -100,7 +100,7 @@ func TestDeltaIdenticalUsesMergedCopy(t *testing.T) {
 		t.Fatalf("COPY 操作不符合预期: %+v", res.Ops[0])
 	}
 
-	blob, err := (&Patch{Mode: ModeFile, Entries: []Entry{{
+	blob, err := (&Patch{Entries: []Entry{{
 		Path: "x.bin", Action: ActionUpdate, OldHash: res.OldHash, NewHash: res.NewHash,
 		OldSize: res.OldSize, NewSize: res.NewSize, Ops: res.Ops,
 	}}}).Encode()

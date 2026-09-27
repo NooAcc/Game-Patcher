@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -102,19 +103,21 @@ func assertFileContent(t *testing.T, path, want string) {
 	}
 }
 
-func TestCreatePatchSingleFileExecutableLayout(t *testing.T) {
+func TestCreatePatchExecutableLayout(t *testing.T) {
 	dir := t.TempDir()
 	base := randomBytes(4096, 11)
 	baseExe := writeTestFile(t, dir, "base.exe", base)
 
+	oldDir := filepath.Join(dir, "old")
+	newDir := filepath.Join(dir, "new")
 	oldData := randomBytes(300<<10, 12)
 	newData := append([]byte(nil), oldData...)
 	newData = append(newData, randomBytes(20<<10, 13)...)
-	oldPath := writeTestFile(t, dir, "old.bin", oldData)
-	newPath := writeTestFile(t, dir, "new.bin", newData)
+	oldPath := writeTestFile(t, oldDir, "target.bin", oldData)
+	writeTestFile(t, newDir, "target.bin", newData)
 	outPath := filepath.Join(dir, "update.exe")
 
-	if err := CreatePatch(baseExe, oldPath, newPath, outPath, "target.bin", ""); err != nil {
+	if err := CreatePatch(baseExe, oldDir, newDir, outPath, ""); err != nil {
 		t.Fatalf("CreatePatch 失败: %v", err)
 	}
 
@@ -144,7 +147,7 @@ func TestCreatePatchSingleFileExecutableLayout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodePatch 失败: %v", err)
 	}
-	if patch.Mode != ModeFile || len(patch.Entries) != 1 || patch.Entries[0].Path != "target.bin" {
+	if len(patch.Entries) != 1 || patch.Entries[0].Path != "target.bin" {
 		t.Fatalf("补丁内容不符合预期: %+v", patch)
 	}
 
@@ -164,13 +167,15 @@ func TestCreatePatchSingleFileExecutableLayout(t *testing.T) {
 func TestCreatePatchWithRestorerTrailer(t *testing.T) {
 	dir := t.TempDir()
 	baseExe := writeTestFile(t, dir, "base.exe", randomBytes(2048, 21))
-	oldPath := writeTestFile(t, dir, "old.bin", []byte("old-old-old"))
-	newPath := writeTestFile(t, dir, "new.bin", []byte("new-new-new"))
+	oldDir := filepath.Join(dir, "old")
+	newDir := filepath.Join(dir, "new")
+	writeTestFile(t, oldDir, "app.bin", []byte("old-old-old"))
+	writeTestFile(t, newDir, "app.bin", []byte("new-new-new"))
 	outPath := filepath.Join(dir, "update.exe")
 	restorerData := []byte("FAKE-RESTORER-BINARY")
 	restorerPath := writeTestFile(t, dir, "restorer.exe", restorerData)
 
-	if err := CreatePatch(baseExe, oldPath, newPath, outPath, "app.bin", restorerPath); err != nil {
+	if err := CreatePatch(baseExe, oldDir, newDir, outPath, restorerPath); err != nil {
 		t.Fatal(err)
 	}
 	extracted, err := extractRestorer(outPath)
@@ -193,7 +198,7 @@ func TestBackupAndVerifyRejectsWrongSource(t *testing.T) {
 	if err := os.MkdirAll(backupDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	patch := &Patch{Mode: ModeFile, Entries: []Entry{{
+	patch := &Patch{Entries: []Entry{{
 		Path: "app.bin", Action: ActionUpdate,
 		OldHash: HashBytes([]byte("expected content")),
 		NewHash: HashBytes([]byte("new")),
@@ -202,5 +207,50 @@ func TestBackupAndVerifyRejectsWrongSource(t *testing.T) {
 	}}}
 	if _, err := backupAndVerify(gameDir, backupDir, patch); err == nil {
 		t.Fatal("源版本不匹配时应返回错误")
+	}
+}
+
+func TestBackupAndVerifyWrongSourceMessage(t *testing.T) {
+	dir := t.TempDir()
+	gameDir := filepath.Join(dir, "game")
+	backupDir := filepath.Join(gameDir, backupDirName)
+	writeTestFile(t, gameDir, "app.bin", []byte("unexpected content"))
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	patch := &Patch{Entries: []Entry{{
+		Path: "app.bin", Action: ActionUpdate,
+		OldHash: HashBytes([]byte("expected content")),
+		NewHash: HashBytes([]byte("new")),
+		OldSize: 16, NewSize: 3,
+		Ops: []DeltaOp{{Kind: OpLiteral, Length: 3, Comp: CompRaw, Data: []byte("new")}},
+	}}}
+	_, err := backupAndVerify(gameDir, backupDir, patch)
+	if err == nil {
+		t.Fatal("源版本不匹配时应返回错误")
+	}
+	if !strings.Contains(err.Error(), "文件被修改") || !strings.Contains(err.Error(), "游戏版本不一致") {
+		t.Fatalf("版本不一致提示不符合预期: %v", err)
+	}
+}
+
+func TestBackupAndVerifyMissingFileMessage(t *testing.T) {
+	dir := t.TempDir()
+	gameDir := filepath.Join(dir, "game")
+	backupDir := filepath.Join(gameDir, backupDirName)
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	patch := &Patch{Entries: []Entry{{
+		Path: "app.bin", Action: ActionDelete,
+		OldHash: HashBytes([]byte("old")),
+		OldSize: 3,
+	}}}
+	_, err := backupAndVerify(gameDir, backupDir, patch)
+	if err == nil {
+		t.Fatal("文件缺失时应返回错误")
+	}
+	if !strings.Contains(err.Error(), "文件不存在") || !strings.Contains(err.Error(), "游戏版本不一致") {
+		t.Fatalf("文件缺失提示不符合预期: %v", err)
 	}
 }

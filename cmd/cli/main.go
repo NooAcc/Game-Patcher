@@ -37,15 +37,17 @@ func main() {
 	// 若自身被追加了补丁数据，则直接作为升级器运行（兜底）。
 	if patcher.HasEmbeddedPatch(selfPath) {
 		if err := patcher.RunEmbedded(selfPath); err != nil {
-			patcher.Fatal("❌ %v", err)
+			fmt.Printf("\n❌ %v\n", err)
+			patcher.Pause()
+			os.Exit(1)
 		}
+		patcher.Pause()
 		return
 	}
 
-	oldPath := flag.String("old", "", "旧版本路径（文件或目录）")
-	newPath := flag.String("new", "", "新版本路径（文件或目录）")
+	oldPath := flag.String("old", "", "旧版本文件夹路径")
+	newPath := flag.String("new", "", "新版本文件夹路径")
 	output := flag.String("out", "", "输出升级工具路径（默认: 当前目录/game-updater.exe）")
-	target := flag.String("target", "", "单文件模式的目标相对路径（默认: 新文件名）")
 	upgraderFlag := flag.String("upgrader", "", "升级工具基础程序路径（默认: 自动查找）")
 	restorerFlag := flag.String("restorer", "", "恢复工具二进制路径（默认: 自动查找）")
 	shellMode := flag.Bool("shell", false, "进入交互模式")
@@ -77,7 +79,7 @@ func main() {
 			patcher.Fatal("❌ 找不到升级工具基础程序 (upgrader)，请使用 -upgrader 指定路径")
 		}
 		restorerPath := findBinary(selfPath, *restorerFlag, restorerCandidates)
-		if err := patcher.CreatePatch(upgraderPath, absOld, absNew, absOut, *target, restorerPath); err != nil {
+		if err := patcher.CreatePatch(upgraderPath, absOld, absNew, absOut, restorerPath); err != nil {
 			patcher.Fatal("❌ 创建失败: %v", err)
 		}
 		return
@@ -119,8 +121,8 @@ func runInteractive(selfPath string) {
 	fmt.Println("╚══════════════════════════════════════╝")
 	fmt.Println()
 
-	oldPath := promptPath(r, "旧版本路径（文件或目录）")
-	newPath := promptPath(r, "新版本路径（文件或目录）")
+	oldPath := promptPath(r, "旧版本文件夹路径")
+	newPath := promptPath(r, "新版本文件夹路径")
 
 	oldInfo, err := os.Stat(oldPath)
 	if err != nil {
@@ -130,13 +132,8 @@ func runInteractive(selfPath string) {
 	if err != nil {
 		patcher.Fatal("❌ 新版本路径无效: %v", err)
 	}
-	if oldInfo.IsDir() != newInfo.IsDir() {
-		patcher.Fatal("❌ 旧版本与新版本必须同为文件或同为目录")
-	}
-
-	target := ""
-	if !newInfo.IsDir() {
-		target = promptTarget(r, filepath.Base(newPath))
+	if !oldInfo.IsDir() || !newInfo.IsDir() {
+		patcher.Fatal("❌ 仅支持目录模式：旧版本与新版本必须都是文件夹")
 	}
 	output := promptOutput(r, selfPath)
 
@@ -149,9 +146,6 @@ func runInteractive(selfPath string) {
 	fmt.Println()
 	fmt.Printf("  旧版本: %s\n", oldPath)
 	fmt.Printf("  新版本: %s\n", newPath)
-	if target != "" {
-		fmt.Printf("  目标文件: %s\n", target)
-	}
 	fmt.Printf("  输  出: %s\n", output)
 	fmt.Printf("  升级工具基础: %s\n", filepath.Base(upgraderPath))
 	if restorerPath != "" {
@@ -161,7 +155,7 @@ func runInteractive(selfPath string) {
 	}
 	fmt.Println()
 
-	if err := patcher.CreatePatch(upgraderPath, oldPath, newPath, output, target, restorerPath); err != nil {
+	if err := patcher.CreatePatch(upgraderPath, oldPath, newPath, output, restorerPath); err != nil {
 		patcher.Fatal("❌ 创建失败: %v", err)
 	}
 }
@@ -185,16 +179,6 @@ func promptPath(r *bufio.Reader, label string) string {
 		}
 		return abs
 	}
-}
-
-func promptTarget(r *bufio.Reader, defaultTarget string) string {
-	fmt.Printf("🎯 目标相对路径（回车默认 [%s]）: ", defaultTarget)
-	line, _ := r.ReadString('\n')
-	line = strings.TrimSpace(line)
-	if line == "" {
-		return defaultTarget
-	}
-	return line
 }
 
 func promptOutput(r *bufio.Reader, selfPath string) string {
@@ -223,15 +207,14 @@ func printUsage() {
 	fmt.Println("=== 二进制增量升级包制作工具 ===")
 	fmt.Println()
 	fmt.Println("参数模式:")
-	fmt.Printf("  %s -old <旧版本> -new <新版本> [-out <输出>] [-target <目标相对路径>]\n", exe)
+	fmt.Printf("  %s -old <旧版本目录> -new <新版本目录> [-out <输出>]\n", exe)
 	fmt.Printf("        [-upgrader <升级工具>] [-restorer <恢复工具>]\n")
 	fmt.Println()
 	fmt.Println("交互模式:")
 	fmt.Printf("  %s -shell\n", exe)
 	fmt.Println()
 	fmt.Println("说明:")
-	fmt.Println("  -old/-new 同为目录时生成目录树补丁；同为文件时生成单文件二进制增量补丁。")
-	fmt.Println("  单文件模式下 -target 指定目标相对路径，默认取新文件名。")
-	fmt.Println("  生成的升级工具放入目标目录，直接运行即可完成升级。")
+	fmt.Println("  -old/-new 必须是两个版本的游戏目录，程序按目录树对比并生成二进制增量补丁。")
+	fmt.Println("  生成的升级工具放入游戏根目录，直接运行即可完成升级。")
 	fmt.Printf("平台: %s/%s\n", runtime.GOOS, runtime.GOARCH)
 }

@@ -1,19 +1,31 @@
 package main
 
 import (
+	"fmt"
 	"os"
 
 	"game-patcher/patcher"
 )
 
 // game-patcher-upgrader 是生成的升级工具模板。
-// 它只做一件事：从自身尾部读取 GPBIN2 补丁并执行升级。
+// 它只做一件事：从自身尾部读取 GPBIN3 补丁并执行升级。
+// 无论成功、取消还是失败，退出前都会等待用户按回车，避免双击运行时窗口闪退。
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	selfPath, err := os.Executable()
 	if err != nil {
-		patcher.Fatal("❌ 获取自身路径失败: %v", err)
+		fmt.Printf("❌ 获取自身路径失败: %v\n", err)
+		patcher.Pause()
+		return 1
 	}
 	if err := patcher.RunEmbedded(selfPath); err != nil {
-		patcher.Fatal("❌ %v", err)
+		fmt.Printf("\n❌ %v\n", err)
+		patcher.Pause()
+		return 1
 	}
+	patcher.Pause()
+	return 0
 }

@@ -1,6 +1,9 @@
 package patcher
 
 import (
+	"bytes"
+	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +25,7 @@ func realASARFixtures(t *testing.T) (oldPath, newPath string, ok bool) {
 	return oldPath, newPath, true
 }
 
+// TestRealASARDeltaRoundTrip 用真实 306MB ASAR 验证差异算法与补丁体积。
 func TestRealASARDeltaRoundTrip(t *testing.T) {
 	if testing.Short() {
 		t.Skip("短模式跳过 306MB ASAR 集成测试")
@@ -38,7 +42,7 @@ func TestRealASARDeltaRoundTrip(t *testing.T) {
 	}
 	buildTime := time.Since(start)
 
-	blob, err := (&Patch{Mode: ModeFile, Entries: []Entry{{
+	blob, err := (&Patch{Entries: []Entry{{
 		Path: "app.asar", Action: ActionUpdate,
 		OldHash: res.OldHash, NewHash: res.NewHash,
 		OldSize: res.OldSize, NewSize: res.NewSize, Ops: res.Ops,
@@ -76,13 +80,10 @@ func TestRealASARDeltaRoundTrip(t *testing.T) {
 	}
 }
 
-func TestRealASARExecutableEndToEnd(t *testing.T) {
+// TestExecutableEndToEnd 用真实生成的升级工具验证目录补丁的打包、升级与回滚。
+func TestExecutableEndToEnd(t *testing.T) {
 	if testing.Short() {
-		t.Skip("短模式跳过端到端 EXE 集成测试")
-	}
-	oldPath, newPath, ok := realASARFixtures(t)
-	if !ok {
-		t.Skip("test/ 中缺少 app.asar / app.asar.orig，跳过")
+		t.Skip("短模式跳过端到端 EXE 测试")
 	}
 
 	root := t.TempDir()
@@ -93,25 +94,28 @@ func TestRealASARExecutableEndToEnd(t *testing.T) {
 		t.Fatalf("构建 upgrader 失败: %v\n%s", err, out)
 	}
 
+	oldDir := filepath.Join(root, "old")
+	newDir := filepath.Join(root, "new")
+	writeTestFile(t, oldDir, "keep.bin", []byte("keep"))
+	writeTestFile(t, oldDir, "sub/mod.bin", []byte("old content"))
+	writeTestFile(t, oldDir, "del.bin", []byte("delete me"))
+	writeTestFile(t, newDir, "keep.bin", []byte("keep"))
+	writeTestFile(t, newDir, "sub/mod.bin", []byte("new content with more bytes"))
+	writeTestFile(t, newDir, "add.bin", []byte("added"))
+
 	gameDir := filepath.Join(root, "game")
-	if err := os.MkdirAll(gameDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	target := filepath.Join(gameDir, "app.asar")
-	if err := copyFileAtomic(oldPath, target); err != nil {
-		t.Fatal(err)
-	}
+	copyTree(t, oldDir, gameDir)
 
 	updateExe := filepath.Join(gameDir, "update.exe")
-	if err := CreatePatch(upgraderExe, oldPath, newPath, updateExe, "app.asar", ""); err != nil {
+	if err := CreatePatch(upgraderExe, oldDir, newDir, updateExe, ""); err != nil {
 		t.Fatalf("CreatePatch 失败: %v", err)
 	}
-	updateInfo, err := os.Stat(updateExe)
+	info, err := os.Stat(updateExe)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updateInfo.Size() > 20<<20 {
-		t.Fatalf("生成的升级工具过大: %d 字节", updateInfo.Size())
+	if info.Size() > 20<<20 {
+		t.Fatalf("生成的升级工具过大: %d 字节", info.Size())
 	}
 
 	run := exec.Command(updateExe)
@@ -124,20 +128,11 @@ func TestRealASARExecutableEndToEnd(t *testing.T) {
 	if !strings.Contains(string(out), "升级完成") {
 		t.Fatalf("升级工具输出异常:\n%s", out)
 	}
-
-	wantNew, err := HashFile(newPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := HashFile(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != wantNew {
-		t.Fatal("升级后文件哈希与新版不一致")
+	assertFilesMatch(t, gameDir, newDir)
+	if _, err := os.Stat(filepath.Join(gameDir, "del.bin")); !os.IsNotExist(err) {
+		t.Fatal("del.bin 应已被删除")
 	}
 
-	// 用备份目录中的恢复清单回滚，验证恢复路径。
 	backupDir := filepath.Join(gameDir, backupDirName)
 	manifest, err := LoadRestoreManifest(backupDir)
 	if err != nil {
@@ -146,15 +141,39 @@ func TestRealASARExecutableEndToEnd(t *testing.T) {
 	if err := Restore(manifest, backupDir); err != nil {
 		t.Fatalf("恢复失败: %v", err)
 	}
-	wantOld, err := HashFile(oldPath)
-	if err != nil {
-		t.Fatal(err)
+	assertFilesMatch(t, gameDir, oldDir)
+	if _, err := os.Stat(filepath.Join(gameDir, "add.bin")); !os.IsNotExist(err) {
+		t.Fatal("add.bin 应已被回滚删除")
 	}
-	got, err = HashFile(target)
+}
+
+func assertFilesMatch(t *testing.T, root, wantDir string) {
+	t.Helper()
+	err := filepath.WalkDir(wantDir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(wantDir, p)
+		if err != nil {
+			return err
+		}
+		want, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		got, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(got, want) {
+			return fmt.Errorf("%s 内容不一致", rel)
+		}
+		return nil
+	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if got != wantOld {
-		t.Fatal("恢复后文件哈希与旧版不一致")
+		t.Fatalf("文件对比失败: %v", err)
 	}
 }
