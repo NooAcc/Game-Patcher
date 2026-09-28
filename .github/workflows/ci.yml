@@ -30,18 +30,40 @@ jobs:
       - name: Test
         run: go test -timeout 30m ./...
 
-      - name: Build
+      - name: Determine version
+        id: version
         shell: pwsh
         run: |
+          # 版本号 = 北京时间（UTC+8，中国无夏令时）时间戳 yyyyMMdd-HHmmss，天然递增
+          $stamp = [DateTime]::UtcNow.AddHours(8).ToString("yyyyMMdd-HHmmss")
+          "stamp=$stamp" >> $env:GITHUB_OUTPUT
+          Write-Host "Version: $stamp"
+
+      - name: Build and pack
+        shell: pwsh
+        run: |
+          $stamp = "${{ steps.version.outputs.stamp }}"
+          $zip = "build/game-patcher-win64-$stamp.zip"
+          $exes = @(
+            "build/game-patcher-cli-win64.exe"
+            "build/game-patcher-upgrader-win64.exe"
+            "build/restorer-win64.exe"
+          )
+
           New-Item -ItemType Directory -Path build -Force | Out-Null
           go build -ldflags="-s -w" -o build/game-patcher-cli-win64.exe ./cmd/cli/
           go build -ldflags="-s -w" -o build/game-patcher-upgrader-win64.exe ./cmd/upgrader/
           go build -ldflags="-s -w" -o build/restorer-win64.exe ./cmd/restorer/
 
-          Get-ChildItem build/*.exe | ForEach-Object {
+          # 三个 exe 打包为单个 zip，zip 内不含目录层级
+          Compress-Archive -Path $exes -DestinationPath $zip -CompressionLevel Optimal
+
+          Get-ChildItem $zip | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
             "$hash  $($_.Name)"
           } | Set-Content -Encoding ascii build/SHA256SUMS.txt
+
+          Get-ChildItem build/* | Select-Object Name, Length
 
       - name: Publish GitHub Release
         if: github.event_name != 'pull_request'
@@ -50,17 +72,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $repo = "${{ github.repository }}"
+          $stamp = "${{ steps.version.outputs.stamp }}"
+          $tag = "v$stamp"
           $files = @(
-            "build/game-patcher-cli-win64.exe"
-            "build/game-patcher-upgrader-win64.exe"
-            "build/restorer-win64.exe"
+            "build/game-patcher-win64-$stamp.zip"
             "build/SHA256SUMS.txt"
           )
-
-          # 版本号 = 北京时间（UTC+8，中国无夏令时）时间戳 yyyyMMdd-HHmmss，天然递增
-          $now = [DateTime]::UtcNow.AddHours(8)
-          $stamp = $now.ToString("yyyyMMdd-HHmmss")
-          $tag = "v$stamp"
 
           # 极端情况（同一秒内重跑）导致 tag 撞车时，用运行编号兜底保证唯一
           gh release view $tag --repo $repo *> $null
