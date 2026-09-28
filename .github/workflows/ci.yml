@@ -1,4 +1,4 @@
-name: CI
+name: CI / Release
 
 on:
   push:
@@ -7,10 +7,14 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  test:
+  build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7.0.1
@@ -34,11 +38,40 @@ jobs:
           go build -ldflags="-s -w" -o build/game-patcher-upgrader-win64.exe ./cmd/upgrader/
           go build -ldflags="-s -w" -o build/restorer-win64.exe ./cmd/restorer/
 
-      - name: Upload snapshot binaries
-        if: github.event_name == 'push'
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: game-patcher-${{ github.sha }}
-          path: build/*.exe
-          if-no-files-found: error
-          retention-days: 7
+          Get-ChildItem build/*.exe | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)"
+          } | Set-Content -Encoding ascii build/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $repo = "${{ github.repository }}"
+          $files = @(
+            "build/game-patcher-cli-win64.exe"
+            "build/game-patcher-upgrader-win64.exe"
+            "build/restorer-win64.exe"
+            "build/SHA256SUMS.txt"
+          )
+
+          # 版本号 = 北京时间（UTC+8，中国无夏令时）时间戳 yyyyMMdd-HHmmss，天然递增
+          $now = [DateTime]::UtcNow.AddHours(8)
+          $stamp = $now.ToString("yyyyMMdd-HHmmss")
+          $tag = "v$stamp"
+
+          # 极端情况（同一秒内重跑）导致 tag 撞车时，用运行编号兜底保证唯一
+          gh release view $tag --repo $repo *> $null
+          if ($LASTEXITCODE -eq 0) {
+            $tag = "v$stamp.${{ github.run_number }}"
+            Write-Host "Tag v$stamp already exists, using $tag instead"
+          }
+
+          Write-Host "Publishing release $tag"
+          gh release create $tag $files `
+            --repo $repo `
+            --target "${{ github.sha }}" `
+            --generate-notes `
+            --title $tag
