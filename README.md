@@ -67,9 +67,15 @@ game-patcher-cli-win64.exe -old ./v1.0 -new ./v1.1 -out ./game-updater.exe
 
 **交互模式**：
 
+直接双击 `game-patcher-cli-win64.exe`（不传任何参数）就会进入交互模式，按提示依次输入新旧版本目录即可：
+
 ```bash
-game-patcher-cli-win64.exe -shell
+game-patcher-cli-win64.exe            # 双击 / 无参数启动，默认交互模式
+game-patcher-cli-win64.exe -shell     # 显式进入交互模式
 ```
+
+> 双击启动时，程序结束前会提示「按回车键退出」，方便查看结果；
+> 无参数但标准输入不是终端（管道 / CI）时仍打印用法并以非零状态退出。
 
 > 生成的 EXE 需要 `game-patcher-upgrader-win64.exe` 作为基础程序、可选地需要
 > `restorer-win64.exe` 作为恢复工具。默认在 CLI 同目录自动查找，也可用
