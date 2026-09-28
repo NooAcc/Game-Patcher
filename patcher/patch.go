@@ -71,7 +71,8 @@ func CreatePatch(baseExe, oldPath, newPath, outputPath, restorerPath string) err
 	return nil
 }
 
-func buildTreePatch(oldDir, newDir, skipPath string) (*Patch, error) {
+// planTreePatch 扫描两个版本目录，生成变更清单（不计算二进制差异）。
+func planTreePatch(oldDir, newDir, skipPath string) ([]treeJob, error) {
 	fmt.Println("🔍 扫描旧版本...")
 	oldFiles, err := scanTree(oldDir, skipPath)
 	if err != nil {
@@ -112,13 +113,37 @@ func buildTreePatch(oldDir, newDir, skipPath string) (*Patch, error) {
 			dels++
 		}
 	}
-	fmt.Printf("\n📊 差异: +%d 新增, ~%d 修改, -%d 删除\n\n", adds, updates, dels)
+	fmt.Printf("\n📊 差异: +%d 新增, ~%d 修改, -%d 删除\n", adds, updates, dels)
+	return jobs, nil
+}
+
+// buildTreePatch 生成目录树补丁：先列出变更清单，交互选择后再计算二进制差异。
+func buildTreePatch(oldDir, newDir, skipPath string) (*Patch, error) {
+	jobs, err := planTreePatch(oldDir, newDir, skipPath)
+	if err != nil {
+		return nil, err
+	}
 	if len(jobs) == 0 {
 		return &Patch{}, nil
 	}
 
+	jobs, err = selectJobs(jobs)
+	if err != nil {
+		return nil, err
+	}
+	if len(jobs) == 0 {
+		return nil, ErrCancelled
+	}
+
+	fmt.Println()
+	fmt.Printf("🔧 正在为 %d 个文件计算二进制差异...\n", len(jobs))
+	return buildTreeEntries(oldDir, newDir, jobs)
+}
+
+// buildTreeEntries 只为选中的变更项计算差异数据。
+func buildTreeEntries(oldDir, newDir string, jobs []treeJob) (*Patch, error) {
 	entries := make([]Entry, len(jobs))
-	err = parallelFor(len(jobs), runtime.NumCPU(), func(i int) error {
+	err := parallelFor(len(jobs), runtime.NumCPU(), func(i int) error {
 		j := &jobs[i]
 		switch j.action {
 		case ActionAdd:

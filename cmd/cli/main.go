@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -80,7 +81,7 @@ func main() {
 		}
 		restorerPath := findBinary(selfPath, *restorerFlag, restorerCandidates)
 		if err := patcher.CreatePatch(upgraderPath, absOld, absNew, absOut, restorerPath); err != nil {
-			patcher.Fatal("❌ 创建失败: %v", err)
+			handleCreateError(err)
 		}
 		return
 	}
@@ -156,7 +157,7 @@ func runInteractive(selfPath string) {
 	fmt.Println()
 
 	if err := patcher.CreatePatch(upgraderPath, oldPath, newPath, output, restorerPath); err != nil {
-		patcher.Fatal("❌ 创建失败: %v", err)
+		handleCreateError(err)
 	}
 }
 
@@ -215,6 +216,17 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("说明:")
 	fmt.Println("  -old/-new 必须是两个版本的游戏目录，程序按目录树对比并生成二进制增量补丁。")
+	fmt.Println("  扫描后会列出所有变更文件，使用 ↑/↓ 移动、空格 选择/取消、回车 生成补丁。")
+	fmt.Println("  非交互终端（管道/CI）会自动包含全部变更文件。")
 	fmt.Println("  生成的升级工具放入游戏根目录，直接运行即可完成升级。")
 	fmt.Printf("平台: %s/%s\n", runtime.GOOS, runtime.GOARCH)
+}
+
+// handleCreateError 统一处理补丁生成错误；用户在选择界面取消时友好退出。
+func handleCreateError(err error) {
+	if errors.Is(err, patcher.ErrCancelled) {
+		fmt.Println("❌ 已取消，未生成补丁。")
+		os.Exit(1)
+	}
+	patcher.Fatal("❌ 创建失败: %v", err)
 }
