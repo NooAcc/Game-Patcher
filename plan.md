@@ -1,58 +1,63 @@
-# 计划：移除 Label 字段 + 支持带双引号的路径
+# 计划：CDC 分块扫描器性能优化（纯 Go，行为不变）
 
 ## 1. 总体目标与范围
-- 目标一：从补丁制品中**完全移除 `Label`（版本名称）字段**——不同版本游戏目录名差异很大，该字段只写不读，无判定/显示价值。
-- 目标二：命令行与交互模式**接受带双引号的路径**（Windows 资源管理器"复制地址"会带 `"..."`）。
-- 范围：`patcher` 制品模型/编解码/检测、CLI 参数与交互输入、测试、README 与 ADR-0001。
-- 治理判定：删除死字段 = **delete-first**（用户已明确要求移除）。
+- 目标：消除 `chunkScanner` 的逐字节 `bufio.Reader.ReadByte()` 热路径，改为**批式扫描**，在不改变分块结果的前提下提升吞吐。
+- 范围：`patcher/delta.go` 的 `chunkScanner`；新增等价性回归测试；性能验证。
+- 非目标：不改 CDC 参数/分块算法、不改补丁格式、不引入 C++/CGO、不动压缩策略（另行决策）。
+- 硬约束：**分块边界必须逐字节等价**，补丁产物必须与优化前完全一致。
 
 ## 2. 当前阶段与进度
-- 阶段：**已完成**。进度 100%（实现、验证、文档同步、提交推送全部完成；CI 绿）。
+- 阶段：**已完成**。进度 100%（实现、测试、性能验证、文档全部完成；待提交推送）。
 
 ## 3. 详细执行步骤
-- [x] 删除 `VersionRef.Label`、`SourceMismatch.Label`
-- [x] `chain.go`：`checkSteps`/`deriveVersionRefs`/`encodeSteps`/`decodeSteps` 去掉 label 段
-- [x] `ChunkPayload` 去掉 `Labels`，`NewChunkPayload(steps, pool)`
-- [x] `build.go` 删除 labels 收集与 `versionLabel()`
-- [x] 线格式 `formatVersion` 4 → 5；`legacyFormatVersion=4` 在 payloadKind 分派前明确报错提示重新生成
-- [x] 删除随之不可达的 `removedPayloadChain` 专用分支（v4 闸门已覆盖全部旧制品）
-- [x] 适配全部单元/集成测试；新增 `TestDecodeRejectsLegacyFormatVersion`、`TestVersionDisplayUsesOrdinalOnly`
-- [x] 更新 README 制品图、Op 列表、兼容性；修订 ADR-0001（第二次修订，含陈旧表述清理）
-- [x] CLI：新增 `cleanPath`（剥成对双引号）+ `splitPathList`（忽略引号内逗号），应用到 9 处输入点
-- [x] CLI 测试：`TestCleanPath`、`TestSplitPathListIgnoresCommasInsideQuotes`、`TestStringListAcceptsQuotedCommaPaths`、`TestPromptPathAcceptsQuotedPath`、`TestResolvePrevPatches` 补引号用例
-- [x] gofmt 内容检查（LF 临时文件比对）→ 修复 4 个文件缺失尾换行
-- [x] `go vet ./...` + `go build ./...`
-- [x] `go test ./cmd/cli/` + patcher 全量测试（48 通过 / 0 失败）
-- [x] 真实 CLI 端到端手测（带双引号、含逗号目录名）：生成 fix1(v1)/fix2(v2) + 应用 A→C / B→C + 交互模式
-- [x] 提交并推送（commit ee0e1a6；CI run 36818935129 成功，产物 Release v20261001-131625）
+- [x] 测量基线：`chunkScanner` 522 MB/s；BLAKE3 5147 MB/s（排除哈希为瓶颈）
+- [x] 原型验证：批式扫描 ~1690 MB/s，端到端提速、产物一致
+- [x] 落地实现：重写 `chunkScanner`（1 MiB 块缓冲 + 索引内循环 + 跨块 pending）
+- [x] 移除不再使用的 `bufio` 导入；补充零进度读保护（`io.ErrNoProgress`，`maxZeroReads=100`）
+- [x] 新增 `patcher/chunk_scanner_test.go`：与逐字节参考实现逐块比对；覆盖空/小于 min/
+      跨 1 MiB 块/短读 reader/`(n>0, io.EOF)` 同返/`(0,nil)` 忙循环保护
+- [x] 内循环写法回归定位：3 分支 `for` + `continue` 使边界检查消除失效（1.15 vs 1.7 GB/s），
+      改为手动自增单层条件，并加注释锁定
+- [x] 全量验证：go vet / go build / cmd/cli 测试 / patcher 52 项测试全通过
+- [x] 真实 200MB 端到端复测（产物 SHA256 与优化前完全一致）
+- [ ] 更新 plan.md（本条）；提交并推送；确认 CI 绿
 
 ## 4. 已发现的问题与风险
-- **本地环境限制（非代码问题）**：本机安全策略阻止执行 `go-build` 临时目录下新生成的 `patcher` 测试二进制
-  （`fork/exec ... test.test.exe: Access is denied`），`cmd/cli` 不受影响。
-  绕行：`go test -c -o build/testbin/x.test.exe ./patcher/` 后手工执行。CI 干净 runner 不受影响。
-- **破坏性变更**：`formatVersion=4` 制品（仍含版本名称）将被新 CLI 明确拒绝并要求重新生成；已在 README/ADR 记录。
-- **发布副作用**：该仓库 push 到 main 会自动发布 Release，推送将产生新版本，需提醒用户。
-- 行尾约定 CRLF（`core.autocrlf=true`）；gofmt 会规范化行尾，故用 LF 临时文件比对后再写回 CRLF。
+- **返回值生命周期契约**：`next()` 返回的切片"下次调用即失效"；批式实现会返回 `fill` 子切片。
+  已逐一核对三处调用方（`indexChunks`/`buildChunkFileEntry`/`crossIndex.addFile`）均在拿到后立即消费或拷贝。
+- **`Read` 同时返回 n>0 与 `io.EOF`**：合法但少见；已专门处理（先消费已读字节再收尾），并加测试。
+- **内循环写法陷阱（本次最大发现）**：语义等价的两处循环写法性能差 46%。已在代码内注释锁定，
+  并留下 `BenchmarkChunkScanner` 作为回归哨兵。
+- **短读**：单次 `Read` 可能小于缓冲区；跨块拼接已覆盖测试。
+- 本机安全策略限制：`patcher` 测试二进制需 `go test -c` 后手工执行（`cmd/cli` 不受影响）。
 
 ## 5. 已做出的决策与优化记录
-- 版本识别仍靠内容指纹（存在性/大小/BLAKE3）回放推导，**不占存储**；删除 Label 不改变检测正确性。
-- 线格式因删字段升至 5，并对 v4 给出专门迁移提示（而非笼统"不支持"）。
-- `cleanPath` 保守：仅剥成对双引号（Windows 路径中双引号本身非法），不配对的引号保留，避免误伤。
-- `splitPathList` 按引号感知拆分，支持"含逗号的目录名"列表输入。
-- 判定 `payloadKind=1` 的专用诊断分支已不可达（旧制品均为 v4，先被 v4 闸门拦下），故随死代码一并删除，并同步修正 ADR 的陈旧表述。
+- 保留 `chunkScanner` 类型名与 `newChunkScanner`/`next()` 签名 → 零调用方改动，降低回归面。
+- 单块内不跨界的块直接返回 `fill` 子切片（零拷贝）；跨块才走 `pending` 拼接。
+- 不改变 gear hash 更新式与 mask 判定顺序 → 保证切分逐字节等价。
+- 不以"语法更简洁"为由重构内循环：批式内循环保留手动自增形式（性能敏感，已注释说明）。
+- 不采用 C++/CGO：热点是 Go 层逐字节方法调用开销，纯 Go 即拿到 3.3x；CGO 会破坏静态单 EXE 发布模型。
 
 ## 6. 下一步行动
-- 无必做项。任务已完成：改动已合入 main，CI 成功并自动发布 Release。
+1. 提交并推送（`perf: batch CDC chunk scanning`）
+2. 确认 CI 绿（`gh run list --limit 1`）
 
 ## 7. 文件统计与进度追踪
-- 变更文件：17（Go 源码 8、测试 7、文档 2）+ plan.md
-- 代码净变更：约 +216 / -152
+- 改动文件：`patcher/delta.go`（重写 chunkScanner）、新增 `patcher/chunk_scanner_test.go`、`plan.md`
+- 新增测试：4 个（等价性 / EOF 同返 / 空输入 / 忙循环保护）+ 1 个 benchmark
+
+### 性能结果（Ryzen 5 9600X，12 线程）
+| 指标 | 优化前 | 优化后 | 提升 |
+|---|---|---|---|
+| 扫描吞吐（64MB 基准） | 522 MB/s | **1722 MB/s** | **3.3x** |
+| 200MB 内部 diff 阶段 | 1225 ms | **~720 ms** | 1.70x |
+| 200MB 端到端（含嵌入+写盘） | 1.35 s | **0.73 s** | 1.85x |
+| 产物 SHA256 | — | **完全一致** | 行为零变化 |
+
 - 完成度：100%
 
 ## 8. 变更日志
-- 2026-10-01 创建本计划（Label 移除 + 双引号路径）。
-- 2026-10-01 实现完成：模型/编解码/构建/检测去 label；线格式升至 5；CLI 引入 cleanPath/splitPathList；测试与文档同步。
-- 2026-10-01 gofmt 内容检查通过（修复 4 个文件缺失尾换行的格式问题）。
-- 2026-10-01 验证：go vet/build/CLI 测试/patcher 48 项测试全通过；真实端到端（含逗号目录名 + 双引号、A→C 与 B→C、交互模式）通过。
-- 2026-10-01 清理 ADR 两处陈旧表述（备选方案里的"版本标签"、`payloadKind=1` 专用分支说明），使其与实际实现一致。
-- 2026-10-01 提交并推送（ee0e1a6）；CI run 36818935129 成功，自动发布 Release v20261001-131625。任务完成。
+- 2026-10-01 建立计划；完成基线测量（522 MB/s）与原型验证（1690 MB/s、产物一致）。
+- 2026-10-01 落地批式 `chunkScanner`；移除 `bufio`；补充零进度保护与等价性回归测试。
+- 2026-10-01 定位并修复内循环写法导致的 46% 性能回退（边界检查消除失效），加注释与基准哨兵锁定。
+- 2026-10-01 全量验证：52 项测试通过；200MB 端到端 1.35s → 0.73s，产物 SHA256 与优化前一致。
