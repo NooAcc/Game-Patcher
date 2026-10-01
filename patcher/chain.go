@@ -6,19 +6,16 @@ import (
 )
 
 // ChainStep 是版本链中的一段：把 SourceIndex 版本升级到 SourceIndex+1 版本。
-// "版本链"是补丁的核心语义；被移除的是 chain 差异存储后端，不是链本身。
+// "版本链"是补丁的核心语义；版本只用链内序号标识，不记录名称。
 type ChainStep struct {
 	SourceIndex uint32
 	Entries     []Entry
 }
 
-// checkSteps 校验版本链结构：标签数与段数匹配、段号从 1 连续、每段非空。
-func checkSteps(labels []string, steps []ChainStep) error {
+// checkSteps 校验版本链结构：段号从 1 连续，且每段至少有一个文件变更。
+func checkSteps(steps []ChainStep) error {
 	if len(steps) == 0 {
 		return fmt.Errorf("补丁链为空")
-	}
-	if len(labels) != len(steps)+1 {
-		return fmt.Errorf("版本标签数量 %d 与段数 %d 不匹配", len(labels), len(steps))
 	}
 	for i := range steps {
 		if steps[i].SourceIndex != uint32(i+1) {
@@ -35,7 +32,7 @@ func checkSteps(labels []string, steps []ChainStep) error {
 //
 // 对只被第 j 段触及的路径，它在版本 1..j+1 中的状态都等于第 j 段应用前的状态；
 // 之后各版本取其最后一次被触及后的状态。
-func deriveVersionRefs(labels []string, steps []ChainStep) []VersionRef {
+func deriveVersionRefs(steps []ChainStep) []VersionRef {
 	n := len(steps)
 	states := make([]map[string]FileState, n+1)
 	for i := range states {
@@ -76,21 +73,13 @@ func deriveVersionRefs(labels []string, steps []ChainStep) []VersionRef {
 			files = append(files, fs)
 		}
 		sort.Slice(files, func(a, b int) bool { return files[a].Path < files[b].Path })
-		label := ""
-		if i < len(labels) {
-			label = labels[i]
-		}
-		out = append(out, VersionRef{Index: uint32(i + 1), Label: label, Files: files})
+		out = append(out, VersionRef{Index: uint32(i + 1), Files: files})
 	}
 	return out
 }
 
-// encodeSteps 写出"版本标签 + 段列表"。
-func encodeSteps(e *encWriter, labels []string, steps []ChainStep) {
-	e.u32(uint32(len(labels)))
-	for _, l := range labels {
-		e.str(l)
-	}
+// encodeSteps 写出段列表。
+func encodeSteps(e *encWriter, steps []ChainStep) {
 	e.u32(uint32(len(steps)))
 	for i := range steps {
 		st := &steps[i]
@@ -102,56 +91,40 @@ func encodeSteps(e *encWriter, labels []string, steps []ChainStep) {
 	}
 }
 
-// decodeSteps 读入"版本标签 + 段列表"。
-func decodeSteps(d *decoder) ([]string, []ChainStep, error) {
-	labelCount, err := d.u32()
-	if err != nil {
-		return nil, nil, err
-	}
-	if uint64(labelCount) > uint64(d.remaining())+1 {
-		return nil, nil, fmt.Errorf("版本标签数量异常: %d", labelCount)
-	}
-	labels := make([]string, 0, labelCount)
-	for i := uint32(0); i < labelCount; i++ {
-		l, err := d.str()
-		if err != nil {
-			return nil, nil, fmt.Errorf("版本标签 %d: %w", i, err)
-		}
-		labels = append(labels, l)
-	}
-
+// decodeSteps 读入段列表。
+func decodeSteps(d *decoder) ([]ChainStep, error) {
 	stepCount, err := d.u32()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if uint64(stepCount) > uint64(d.remaining())+1 {
-		return nil, nil, fmt.Errorf("版本段数量异常: %d", stepCount)
+		return nil, fmt.Errorf("版本段数量异常: %d", stepCount)
 	}
 	steps := make([]ChainStep, 0, stepCount)
 	for i := uint32(0); i < stepCount; i++ {
 		srcIndex, err := d.u32()
 		if err != nil {
-			return nil, nil, fmt.Errorf("第 %d 段: %w", i+1, err)
+			return nil, fmt.Errorf("第 %d 段: %w", i+1, err)
 		}
 		entryCount, err := d.u32()
 		if err != nil {
-			return nil, nil, fmt.Errorf("第 %d 段: %w", i+1, err)
+			return nil, fmt.Errorf("第 %d 段: %w", i+1, err)
 		}
 		if uint64(entryCount) > uint64(d.remaining())+1 {
-			return nil, nil, fmt.Errorf("第 %d 段条目数量异常: %d", i+1, entryCount)
+			return nil, fmt.Errorf("第 %d 段条目数量异常: %d", i+1, entryCount)
 		}
 		st := ChainStep{SourceIndex: srcIndex, Entries: make([]Entry, 0, entryCount)}
 		for j := uint32(0); j < entryCount; j++ {
 			en, err := decodeEntry(d)
 			if err != nil {
-				return nil, nil, fmt.Errorf("第 %d 段条目 %d: %w", i+1, j, err)
+				return nil, fmt.Errorf("第 %d 段条目 %d: %w", i+1, j, err)
 			}
 			st.Entries = append(st.Entries, en)
 		}
 		steps = append(steps, st)
 	}
-	if err := checkSteps(labels, steps); err != nil {
-		return nil, nil, err
+	if err := checkSteps(steps); err != nil {
+		return nil, err
 	}
-	return labels, steps, nil
+	return steps, nil
 }

@@ -3,7 +3,6 @@ package patcher
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"time"
 )
@@ -92,22 +91,16 @@ func CreatePatchWithOptions(opts CreatePatchOptions) error {
 	}
 
 	// 4. 拼接版本链。
-	var (
-		labels       []string
-		steps        []ChainStep
-		patchVersion = uint32(1)
-	)
+	// 版本只用链内序号标识：不记录、不显示源目录名。
+	steps := make([]ChainStep, 0, 1)
+	patchVersion := uint32(1)
 	if prev != nil {
-		labels = append(labels, prev.Payload.Labels...)
 		steps = append(steps, prev.Payload.Steps...)
 		patchVersion = prev.PatchVersion + 1
-	} else {
-		labels = append(labels, versionLabel(oldPath))
 	}
 	steps = append(steps, ChainStep{SourceIndex: uint32(len(steps) + 1), Entries: entries})
-	labels = append(labels, versionLabel(newPath))
 
-	payload := NewChunkPayload(labels, steps, pool.blobs)
+	payload := NewChunkPayload(steps, pool.blobs)
 	if err := payload.SelfCheck(); err != nil {
 		return err
 	}
@@ -201,12 +194,4 @@ func stepsPrefix(short, long []ChainStep) error {
 		}
 	}
 	return nil
-}
-
-func versionLabel(dir string) string {
-	label := filepath.Base(filepath.Clean(dir))
-	if label == "" || label == "." || label == string(filepath.Separator) {
-		return "version"
-	}
-	return label
 }

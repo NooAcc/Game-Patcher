@@ -14,7 +14,6 @@ func TestChunkPayloadEncodeDecodeRoundTrip(t *testing.T) {
 	pool.intern([]byte("hello-pool-a")) // 重复内容应复用同一块
 
 	cp := NewChunkPayload(
-		[]string{"v1", "v2"},
 		[]ChainStep{{SourceIndex: 1, Entries: []Entry{{
 			Path: "x.bin", Action: ActionUpdate,
 			OldHash: HashBytes([]byte("old")), NewHash: HashBytes([]byte("new")),
@@ -61,7 +60,6 @@ func TestChunkPayloadEncodeDecodeRoundTrip(t *testing.T) {
 
 func TestChunkPayloadSelfCheckRejectsBadPoolRef(t *testing.T) {
 	cp := NewChunkPayload(
-		[]string{"v1", "v2"},
 		[]ChainStep{{SourceIndex: 1, Entries: []Entry{{
 			Path: "x.bin", Action: ActionAdd, NewSize: 4,
 			Ops: []DeltaOp{{Kind: OpPoolRef, PoolIndex: 7, Length: 4}},
@@ -73,7 +71,6 @@ func TestChunkPayloadSelfCheckRejectsBadPoolRef(t *testing.T) {
 	}
 
 	cp2 := NewChunkPayload(
-		[]string{"v1", "v2"},
 		[]ChainStep{{SourceIndex: 1, Entries: []Entry{{
 			Path: "x.bin", Action: ActionAdd,
 			Ops: []DeltaOp{{Kind: OpCopyFrom, SrcPath: "../escape", Length: 4}},

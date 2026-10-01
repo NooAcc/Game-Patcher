@@ -10,9 +10,10 @@ type FileState struct {
 }
 
 // VersionRef 是补丁链中一个版本的指纹，供应用端自动检测使用。
+// 版本没有名称：链内序号（Index）就是它在补丁中的唯一标识，
+// 因为不同版本的游戏目录名差异很大，记录目录名没有意义。
 type VersionRef struct {
 	Index uint32      // 版本序号，链内从 1 开始
-	Label string      // 版本标签（默认取目录名）
 	Files []FileState // 按 Path 升序，覆盖补丁触及的全部路径
 }
 
@@ -21,12 +22,10 @@ type PayloadKind uint8
 
 const (
 	// PayloadChunk 是补丁唯一的差异数据格式：版本链 + 共享字面量池 + 跨文件块复用。
-	// 取值保持为 2，确保此前生成的 chunk 补丁仍可读取。
+	//
+	// 共享块池与跨文件复用的实现依赖 chunk.SelfCheck 中校验的 Pool 与 OpCopyFrom
+	// 约束，因此 payloadKind 保留了它的值空间。
 	PayloadChunk PayloadKind = 2
-
-	// removedPayloadChain 是已退役的 chain 格式判别值。
-	// 仅用于在读取旧制品时给出明确的迁移提示，不保留任何 chain 行为。
-	removedPayloadChain PayloadKind = 1
 )
 
 // Blob 是共享字面量池中的一个数据块。

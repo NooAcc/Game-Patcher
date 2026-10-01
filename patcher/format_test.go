@@ -14,7 +14,6 @@ func sampleRelease() *Release {
 	return &Release{
 		PatchVersion: 1,
 		Payload: NewChunkPayload(
-			[]string{"v1", "v2"},
 			[]ChainStep{{
 				SourceIndex: 1,
 				Entries: []Entry{
@@ -58,7 +57,7 @@ func TestReleaseEncodeDecodeRoundTrip(t *testing.T) {
 	if gotPayload == nil {
 		t.Fatal("差异数据丢失")
 	}
-	if len(gotPayload.Labels) != len(src.Labels) || len(gotPayload.Steps) != len(src.Steps) {
+	if len(gotPayload.Steps) != len(src.Steps) {
 		t.Fatalf("链结构不一致: %+v", gotPayload)
 	}
 	if len(gotPayload.Pool) != len(src.Pool) {
@@ -125,7 +124,6 @@ func TestDecodeReleaseRejectsBadMagicVersionAndKind(t *testing.T) {
 
 func TestEncodeReleaseRejectsUnsafePath(t *testing.T) {
 	rel := &Release{PatchVersion: 1, Payload: NewChunkPayload(
-		[]string{"a", "b"},
 		[]ChainStep{{SourceIndex: 1, Entries: []Entry{{Path: "../evil.txt", Action: ActionUpdate}}}},
 		nil,
 	)}
@@ -142,9 +140,9 @@ func TestDecodeReleaseRejectsHugeCounts(t *testing.T) {
 	b.WriteByte(byte(PayloadChunk))
 	var v [4]byte
 	b.Write(v[:])                           // patchVersion = 0
-	b.Write([]byte{0xFF, 0xFF, 0xFF, 0xFF}) // labelCount 超大
+	b.Write([]byte{0xFF, 0xFF, 0xFF, 0xFF}) // stepCount 超大
 	if _, err := DecodeRelease(b.Bytes()); err == nil {
-		t.Fatal("超大版本标签数应被拒绝")
+		t.Fatal("超大版本段数应被拒绝")
 	}
 }
 
@@ -155,10 +153,10 @@ func TestChainSelfCheckRejectsBrokenChain(t *testing.T) {
 		name  string
 		chain *ChunkPayload
 	}{
-		{"空链", NewChunkPayload([]string{"a"}, nil, nil)},
-		{"标签数量不符", NewChunkPayload([]string{"a"}, []ChainStep{{SourceIndex: 1, Entries: []Entry{entry}}}, pool)},
-		{"源序号跳跃", NewChunkPayload([]string{"a", "b"}, []ChainStep{{SourceIndex: 2, Entries: []Entry{entry}}}, pool)},
-		{"空段", NewChunkPayload([]string{"a", "b"}, []ChainStep{{SourceIndex: 1}}, nil)},
+		{"空链", NewChunkPayload(nil, nil)},
+		{"源序号跳跃", NewChunkPayload([]ChainStep{{SourceIndex: 2, Entries: []Entry{entry}}}, pool)},
+		{"空段", NewChunkPayload([]ChainStep{{SourceIndex: 1}}, nil)},
+		{"块池引用越界", NewChunkPayload([]ChainStep{{SourceIndex: 1, Entries: []Entry{entry}}}, nil)},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

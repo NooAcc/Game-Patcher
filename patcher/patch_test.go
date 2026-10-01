@@ -63,11 +63,7 @@ func buildSingleStepPayload(t *testing.T, oldDir, newDir string) *ChunkPayload {
 	if len(entries) != len(jobs) {
 		t.Fatalf("条目数 %d 与变更数 %d 不一致", len(entries), len(jobs))
 	}
-	payload := NewChunkPayload(
-		[]string{versionLabel(oldDir), versionLabel(newDir)},
-		[]ChainStep{{SourceIndex: 1, Entries: entries}},
-		pool.blobs,
-	)
+	payload := NewChunkPayload([]ChainStep{{SourceIndex: 1, Entries: entries}}, pool.blobs)
 	if err := payload.SelfCheck(); err != nil {
 		t.Fatalf("补丁自检失败: %v", err)
 	}

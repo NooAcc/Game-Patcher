@@ -37,13 +37,46 @@ type stringList []string
 func (s *stringList) String() string { return strings.Join(*s, ",") }
 
 func (s *stringList) Set(v string) error {
-	for _, part := range strings.Split(v, ",") {
-		part = strings.TrimSpace(part)
-		if part != "" {
+	for _, part := range splitPathList(v) {
+		if part = cleanPath(part); part != "" {
 			*s = append(*s, part)
 		}
 	}
 	return nil
+}
+
+// splitPathList 按逗号拆分列表，但忽略双引号内部的逗号
+// （从资源管理器复制的路径可能形如 "D:\Games, Inc\v1"）。
+func splitPathList(s string) []string {
+	parts := make([]string, 0, 1)
+	var cur strings.Builder
+	inQuote := false
+	for _, r := range s {
+		switch {
+		case r == '"':
+			inQuote = !inQuote
+			cur.WriteRune(r)
+		case r == ',' && !inQuote:
+			parts = append(parts, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	return append(parts, cur.String())
+}
+
+// cleanPath 规范化用户粘贴的路径。
+//
+// Windows 资源管理器的"复制文件/文件夹地址"得到的是带双引号的形式
+// （"D:\Games\My Game"），直接粘贴会连引号一起进入程序。双引号在 Windows 路径中
+// 本身非法，因此可以安全剥掉；同时去掉粘贴常见的首尾空白。
+func cleanPath(s string) string {
+	s = strings.TrimSpace(s)
+	for len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+	}
+	return s
 }
 
 func main() {
@@ -89,15 +122,15 @@ func main() {
 		if *output == "" {
 			*output = "game-updater.exe"
 		}
-		absOld, err := filepath.Abs(*oldPath)
+		absOld, err := filepath.Abs(cleanPath(*oldPath))
 		if err != nil {
 			patcher.Fatal("❌ 旧版本路径无效: %v", err)
 		}
-		absNew, err := filepath.Abs(*newPath)
+		absNew, err := filepath.Abs(cleanPath(*newPath))
 		if err != nil {
 			patcher.Fatal("❌ 新版本路径无效: %v", err)
 		}
-		absOut, err := filepath.Abs(*output)
+		absOut, err := filepath.Abs(cleanPath(*output))
 		if err != nil {
 			patcher.Fatal("❌ 输出路径无效: %v", err)
 		}
@@ -136,6 +169,7 @@ func main() {
 func resolvePrevPatches(in []string) ([]string, error) {
 	out := make([]string, 0, len(in))
 	for _, p := range in {
+		p = cleanPath(p)
 		abs, err := filepath.Abs(p)
 		if err != nil {
 			return nil, fmt.Errorf("旧补丁路径无效 %s: %w", p, err)
@@ -161,6 +195,7 @@ func launchedByDoubleClick(shellFlag bool, flagCount, argCount int, stdinIsTTY b
 
 // findBinary 查找二进制：优先用户指定，否则在 CLI 同目录按候选名查找。
 func findBinary(selfPath, userSpecified string, candidates []string) string {
+	userSpecified = cleanPath(userSpecified)
 	if userSpecified != "" {
 		if _, err := os.Stat(userSpecified); err != nil {
 			fmt.Printf("⚠️  指定的文件不存在: %s\n", userSpecified)
@@ -256,7 +291,7 @@ func promptPrevPatches(r *bufio.Reader) ([]string, error) {
 	for {
 		fmt.Print("🔗 要附加的旧版本补丁路径（直接回车结束，可多次输入）: ")
 		line, err := r.ReadString('\n')
-		line = strings.TrimSpace(strings.Trim(line, `"`))
+		line = cleanPath(line)
 		if line == "" {
 			if err != nil {
 				return out, nil
@@ -278,14 +313,14 @@ func promptPrevPatches(r *bufio.Reader) ([]string, error) {
 	}
 }
 
-func promptPath(r *bufio.Reader, label string) (string, error) {
+func promptPath(r *bufio.Reader, title string) (string, error) {
 	for {
-		fmt.Printf("📂 %s: ", label)
+		fmt.Printf("📂 %s: ", title)
 		line, err := r.ReadString('\n')
-		line = strings.TrimSpace(line)
+		line = cleanPath(line)
 		if line == "" {
 			if err != nil {
-				return "", fmt.Errorf("输入已结束，未获取到%s", label)
+				return "", fmt.Errorf("输入已结束，未获取到%s", title)
 			}
 			continue
 		}
@@ -307,7 +342,7 @@ func promptOutput(r *bufio.Reader, selfPath string) string {
 	for {
 		fmt.Printf("💾 输出文件路径（回车默认 [%s]）: ", defaultOut)
 		line, err := r.ReadString('\n')
-		line = strings.TrimSpace(line)
+		line = cleanPath(line)
 		if line == "" {
 			return defaultOut
 		}
