@@ -225,9 +225,10 @@ func TestExecutableEndToEndChain(t *testing.T) {
 		t.Fatalf("构建 upgrader 失败: %v\n%s", err, out)
 	}
 
-	v1 := filepath.Join(root, "v1")
-	v2 := filepath.Join(root, "v2")
-	v3 := filepath.Join(root, "v3")
+	// 版本目录名刻意不使用 v1/v2/v3 形式，用于验证输出只显示链内序号。
+	v1 := filepath.Join(root, "build-2026-01-alpha")
+	v2 := filepath.Join(root, "build-2026-02-beta")
+	v3 := filepath.Join(root, "build-2026-03-final")
 	writeTestFile(t, v1, "data.bin", []byte("alpha"))
 	writeTestFile(t, v1, "gone.bin", []byte("only in v1"))
 	writeTestFile(t, v2, "data.bin", []byte("alpha beta"))
@@ -251,6 +252,13 @@ func TestExecutableEndToEndChain(t *testing.T) {
 	out := runUpdater(t, fix2, gameA, true)
 	if !strings.Contains(out, "升级完成") {
 		t.Fatalf("v1 升级输出异常:\n%s", out)
+	}
+	// 版本显示必须使用链内序号，且不得带出构建时的目录名。
+	if !strings.Contains(out, "检测到当前版本: v1") || !strings.Contains(out, "目标版本: v3") {
+		t.Fatalf("版本显示应使用链内序号 v1/v3：\n%s", out)
+	}
+	if strings.Contains(out, "build-2026-01-alpha") || strings.Contains(out, "build-2026-03-final") {
+		t.Fatalf("版本显示不应带出目录名：\n%s", out)
 	}
 	assertFilesMatch(t, gameA, v3)
 
@@ -276,8 +284,11 @@ func TestExecutableEndToEndChain(t *testing.T) {
 	gameC := filepath.Join(root, "gameC")
 	copyTree(t, v3, gameC)
 	outC := runUpdater(t, fix2, gameC, false)
-	if !strings.Contains(outC, "已经是最新版本") {
+	if !strings.Contains(outC, "已经是最新版本（v3）") {
 		t.Fatalf("已是最新版本输出异常:\n%s", outC)
+	}
+	if strings.Contains(outC, "build-2026-03-final") {
+		t.Fatalf("已是最新版本输出不应带出目录名：\n%s", outC)
 	}
 	if _, err := os.Stat(filepath.Join(gameC, backupDirName)); !os.IsNotExist(err) {
 		t.Fatal("已是最新版本时不应创建备份目录")

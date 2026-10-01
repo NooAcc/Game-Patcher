@@ -267,3 +267,12 @@ func TestVerifyStageSourceRejectsExistingAddTarget(t *testing.T) {
 		t.Fatalf("已存在的目标应被拒绝: %v", err)
 	}
 }
+
+func TestVersionDisplayUsesOrdinalOnly(t *testing.T) {
+	cases := map[uint32]string{1: "v1", 2: "v2", 13: "v13"}
+	for in, want := range cases {
+		if got := versionDisplay(in); got != want {
+			t.Fatalf("versionDisplay(%d) = %q，期望 %q", in, got, want)
+		}
+	}
+}
