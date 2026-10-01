@@ -9,7 +9,7 @@ import (
 // GPBIN4 是链式补丁制品格式。信封布局：
 //
 //	"GPBIN4"       6B   魔数
-//	formatVersion  u8   (= 4)
+//	formatVersion  u8   (= 5)
 //	payloadKind    u8   差异后端类型
 //	patchVersion   u32  自动递增的补丁版本号
 //	payload        ...  由 payloadKind 决定
@@ -21,7 +21,12 @@ const (
 	patchMagic    = "GPBIN4"
 	patchEndMagic = "GPBIN4END!"
 	restorerMagic = "GPBIN4RST!"
-	formatVersion = 4
+
+	// formatVersion 是补丁制品的线格式版本。5 起版本链不再携带版本名称（Label）。
+	formatVersion = 5
+
+	// legacyFormatVersion 是仍携带版本名称的旧线格式，仅用于给出明确的迁移提示。
+	legacyFormatVersion = 4
 )
 
 // Action 描述一个条目要执行的变更。
@@ -121,6 +126,9 @@ func DecodeRelease(data []byte) (*Release, error) {
 	if err != nil {
 		return nil, err
 	}
+	if ver == legacyFormatVersion {
+		return nil, fmt.Errorf("该补丁使用已淘汰的旧格式（v%d），请用当前版本的 CLI 重新生成补丁", ver)
+	}
 	if ver != formatVersion {
 		return nil, fmt.Errorf("不支持的补丁格式版本: %d", ver)
 	}
@@ -137,8 +145,6 @@ func DecodeRelease(data []byte) (*Release, error) {
 	switch PayloadKind(kind) {
 	case PayloadChunk:
 		payload, err = decodeChunkPayload(d)
-	case removedPayloadChain:
-		return nil, fmt.Errorf("该补丁使用已移除的 chain 后端；请用当前版本的 CLI 重新生成补丁")
 	default:
 		return nil, fmt.Errorf("不支持的差异后端类型: %d", kind)
 	}

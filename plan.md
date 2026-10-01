@@ -1,54 +1,58 @@
-# 计划：退役 chain 后端，仅保留 chunk 后端（delete-first）
+# 计划：移除 Label 字段 + 支持带双引号的路径
 
 ## 1. 总体目标与范围
-- 目标：完全移除 chain 差异后端，使 chunk 成为唯一后端，消除因"多后端"产生的分叉 owner。
-- 治理判定：内部代码退役 → **delete-first**（用户已给出明确范围确认）。
-- 范围：后端实现、构建入口、CLI 开关、测试、文档与 ADR。
+- 目标一：从补丁制品中**完全移除 `Label`（版本名称）字段**——不同版本游戏目录名差异很大，该字段只写不读，无判定/显示价值。
+- 目标二：命令行与交互模式**接受带双引号的路径**（Windows 资源管理器"复制地址"会带 `"..."`）。
+- 范围：`patcher` 制品模型/编解码/检测、CLI 参数与交互输入、测试、README 与 ADR-0001。
+- 治理判定：删除死字段 = **delete-first**（用户已明确要求移除）。
 
 ## 2. 当前阶段与进度
-- 阶段：**已完成**。进度 100%。
+- 阶段：**已完成**。进度 100%（实现、验证、文档同步全部完成；待提交/推送）。
 
-## 3. 退役执行结果（责任域）
-| 载体 | 处置 |
-|---|---|
-| `PayloadChain` 常量 | 已删除（保留 `removedPayloadChain=1` 仅用于旧制品诊断） |
-| `Chain` 结构与其全部方法 | 已删除；`Sources/Target/状态回放` 迁移到 `ChunkPayload` |
-| `buildStepEntries` | 已删除 |
-| `buildDelta` / `buildLiteralOps` / `applyDelta` 包装 | 已删除（生产与测试统一走 `buildChunkFileEntry` / `applyOps`） |
-| `CreatePatchOptions.Backend` | 已删除 |
-| `kindName` / `checkPayload` / `payloadLabelsSteps` 多态分派 | 已收敛为 chunk 单一实现 |
-| CLI `-payload` / `parseBackend` / `backendName` / `promptBackend` | 已删除 |
-| ADR-0001 "两个后端" 章节 | 已修订（amend，含退役说明） |
-| README `-payload` 章节 | 已改写为"共享块池 + 跨文件复用" |
+## 3. 详细执行步骤
+- [x] 删除 `VersionRef.Label`、`SourceMismatch.Label`
+- [x] `chain.go`：`checkSteps`/`deriveVersionRefs`/`encodeSteps`/`decodeSteps` 去掉 label 段
+- [x] `ChunkPayload` 去掉 `Labels`，`NewChunkPayload(steps, pool)`
+- [x] `build.go` 删除 labels 收集与 `versionLabel()`
+- [x] 线格式 `formatVersion` 4 → 5；`legacyFormatVersion=4` 在 payloadKind 分派前明确报错提示重新生成
+- [x] 删除随之不可达的 `removedPayloadChain` 专用分支（v4 闸门已覆盖全部旧制品）
+- [x] 适配全部单元/集成测试；新增 `TestDecodeRejectsLegacyFormatVersion`、`TestVersionDisplayUsesOrdinalOnly`
+- [x] 更新 README 制品图、Op 列表、兼容性；修订 ADR-0001（第二次修订，含陈旧表述清理）
+- [x] CLI：新增 `cleanPath`（剥成对双引号）+ `splitPathList`（忽略引号内逗号），应用到 9 处输入点
+- [x] CLI 测试：`TestCleanPath`、`TestSplitPathListIgnoresCommasInsideQuotes`、`TestStringListAcceptsQuotedCommaPaths`、`TestPromptPathAcceptsQuotedPath`、`TestResolvePrevPatches` 补引号用例
+- [x] gofmt 内容检查（LF 临时文件比对）→ 修复 4 个文件缺失尾换行
+- [x] `go vet ./...` + `go build ./...`
+- [x] `go test ./cmd/cli/` + patcher 全量测试（48 通过 / 0 失败）
+- [x] 真实 CLI 端到端手测（带双引号、含逗号目录名）：生成 fix1(v1)/fix2(v2) + 应用 A→C / B→C + 交互模式
+- [ ] 提交并推送
 
-**保留（非 chain 专属）**：`ChainStep`/标签/指纹回放（版本链语义）、`Entry`/`DeltaOp`/四种 Op、
-`indexChunks`/`chunkScanner`/`compressLiteral`/`literalReader`、`applyOps`/`materialize`/`opContext`、
-`Payload` 契约与 `payloadKind` 线格式字段（判别 + ADR 记录的 `payloadKind=3` 扩展点）。
-
-## 4. 兼容性边界
-- 线格式 `PayloadChunk = 2` 保持不变 → 此前生成的 chunk 补丁仍可读取与 `-prev` 拼接。
-- `payloadKind=1`（chain）→ 明确报错并提示用当前 CLI 重新生成；已发布的旧 EXE 自带旧代码不受影响。
-- 版本检测、备份/回滚、`restore.json` 与 restorer 契约未变。
-
-## 5. 验证结果
-- `go build ./...` 通过；`go vet ./...` 通过；`gofmt` 内容检查干净。
-- `cmd/cli` 测试通过；`patcher` 完整测试（含两个真实 EXE 端到端）通过，失败数 0。
-- 真实 CLI 端到端：fix1(v1→v2) + fix2(v2→v3, `-prev fix1`)；v1→v3、v2→v3 均一步到位，v3 提示已是最新且不落盘；`-payload` 已不再被接受。
-- 退役期发现并修复一个真实缺陷：测试 helper 构造补丁时丢弃块池，导致"块池引用越界"；已改为统一构造完整补丁并执行 `SelfCheck`。
-
-## 6. 已发现的问题与风险
-- **本地环境限制（非代码问题）**：本机安全策略阻止执行 `go-build` 工作目录下新生成的 `patcher` 测试二进制
+## 4. 已发现的问题与风险
+- **本地环境限制（非代码问题）**：本机安全策略阻止执行 `go-build` 临时目录下新生成的 `patcher` 测试二进制
   （`fork/exec ... test.test.exe: Access is denied`），`cmd/cli` 不受影响。
-  已验证：用 `go test -c -o build/testbin/x.test.exe ./patcher/` 手工产出后执行，完整套件全部通过。
-  CI（干净 runner）不受此影响。
-- 保留的 `removedPayloadChain` 仅为旧制品诊断，不承载任何 chain 行为。
+  绕行：`go test -c -o build/testbin/x.test.exe ./patcher/` 后手工执行。CI 干净 runner 不受影响。
+- **破坏性变更**：`formatVersion=4` 制品（仍含版本名称）将被新 CLI 明确拒绝并要求重新生成；已在 README/ADR 记录。
+- **发布副作用**：该仓库 push 到 main 会自动发布 Release，推送将产生新版本，需提醒用户。
+- 行尾约定 CRLF（`core.autocrlf=true`）；gofmt 会规范化行尾，故用 LF 临时文件比对后再写回 CRLF。
 
-## 7. 下一步行动
-- 无必做项。可选：确认 CI 上 `go test ./...` 正常（预期正常）。
+## 5. 已做出的决策与优化记录
+- 版本识别仍靠内容指纹（存在性/大小/BLAKE3）回放推导，**不占存储**；删除 Label 不改变检测正确性。
+- 线格式因删字段升至 5，并对 v4 给出专门迁移提示（而非笼统"不支持"）。
+- `cleanPath` 保守：仅剥成对双引号（Windows 路径中双引号本身非法），不配对的引号保留，避免误伤。
+- `splitPathList` 按引号感知拆分，支持"含逗号的目录名"列表输入。
+- 判定 `payloadKind=1` 的专用诊断分支已不可达（旧制品均为 v4，先被 v4 闸门拦下），故随死代码一并删除，并同步修正 ADR 的陈旧表述。
+
+## 6. 下一步行动
+1. 提交（`fix!: drop version labels and accept quoted paths`）并推送
+2. 确认 CI 绿（`gh run list --limit 1`）
+
+## 7. 文件统计与进度追踪
+- 变更文件：17（Go 源码 8、测试 7、文档 2）+ plan.md
+- 代码净变更：约 +216 / -152
+- 完成度：100%
 
 ## 8. 变更日志
-- 2026-10-01 创建退役计划（delete-first）与退役清单。
-- 2026-10-01 完成退役：删除 chain 实现/构建入口/CLI 开关，收敛为 chunk 单一后端；同步修订 README 与 ADR-0001。
-- 2026-10-01 修复测试 helper 的块池丢失缺陷；完整测试与真实 CLI 端到端验证通过。
-- 2026-10-01 修复显示：应用补丁时的版本一律按链内序号显示 v1/v2/v3，不再显示构建目录名；
-  制品仍保留 Label 作为溯源信息，仅不再展示。新增端到端断言（用非 v 命名的目录名验证不泄漏）。
+- 2026-10-01 创建本计划（Label 移除 + 双引号路径）。
+- 2026-10-01 实现完成：模型/编解码/构建/检测去 label；线格式升至 5；CLI 引入 cleanPath/splitPathList；测试与文档同步。
+- 2026-10-01 gofmt 内容检查通过（修复 4 个文件缺失尾换行的格式问题）。
+- 2026-10-01 验证：go vet/build/CLI 测试/patcher 48 项测试全通过；真实端到端（含逗号目录名 + 双引号、A→C 与 B→C、交互模式）通过。
+- 2026-10-01 清理 ADR 两处陈旧表述（备选方案里的"版本标签"、`payloadKind=1` 专用分支说明），使其与实际实现一致。

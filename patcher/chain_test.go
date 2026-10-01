@@ -65,7 +65,6 @@ func buildTestPayload(t *testing.T, dirs []string, pool *blobPool) *ChunkPayload
 	if pool == nil {
 		pool = newBlobPool()
 	}
-	labels := []string{versionLabel(dirs[0])}
 	steps := make([]ChainStep, 0, len(dirs)-1)
 	for i := 0; i+1 < len(dirs); i++ {
 		jobs, err := planStep(dirs[i], dirs[i+1], "")
@@ -80,9 +79,8 @@ func buildTestPayload(t *testing.T, dirs []string, pool *blobPool) *ChunkPayload
 			t.Fatalf("版本 %d -> %d 没有任何变更", i+1, i+2)
 		}
 		steps = append(steps, ChainStep{SourceIndex: uint32(i + 1), Entries: entries})
-		labels = append(labels, versionLabel(dirs[i+1]))
 	}
-	payload := NewChunkPayload(labels, steps, pool.blobs)
+	payload := NewChunkPayload(steps, pool.blobs)
 	if err := payload.SelfCheck(); err != nil {
 		t.Fatalf("补丁自检失败: %v", err)
 	}
@@ -107,9 +105,9 @@ func TestChainDerivesVersionStates(t *testing.T) {
 	if len(sources) != 3 {
 		t.Fatalf("应推导出 3 个版本，实际 %d", len(sources))
 	}
-	for i, want := range []string{"v1", "v2", "v3"} {
-		if sources[i].Label != want {
-			t.Fatalf("版本 %d 标签 = %q，期望 %q", i+1, sources[i].Label, want)
+	for i := range sources {
+		if sources[i].Index != uint32(i+1) {
+			t.Fatalf("版本 %d 的序号 = %d，期望 %d", i+1, sources[i].Index, i+1)
 		}
 	}
 	wantHashes := []string{"version-one", "version-two-longer", "version-three-even-longer"}
@@ -263,8 +261,9 @@ func TestCreatePatchChainWithPrev(t *testing.T) {
 	if len(rel2.Payload.Steps) != 2 {
 		t.Fatalf("fix2 应包含两段差异，实际 %d", len(rel2.Payload.Steps))
 	}
-	if strings.Join(rel2.Payload.Labels, "→") != "v1→v2→v3" {
-		t.Fatalf("版本链标签不符合预期: %v", rel2.Payload.Labels)
+	sources := rel2.Payload.Sources()
+	if len(sources) != 3 || sources[0].Index != 1 || sources[1].Index != 2 || sources[2].Index != 3 {
+		t.Fatalf("版本链序号不符合预期: %+v", sources)
 	}
 
 	// fix2 必须能把 A 和 B 都升级到 C。
@@ -339,19 +338,19 @@ func TestChainEncodeDecodePreservesMultipleSteps(t *testing.T) {
 	}
 }
 
-// 已退役的 chain 制品必须被明确拒绝，并提示重新生成。
-func TestDecodeRejectsRemovedChainBackend(t *testing.T) {
+// 旧线格式（版本链仍携带版本名称）必须被明确拒绝，并提示重新生成。
+func TestDecodeRejectsLegacyFormatVersion(t *testing.T) {
 	var b bytes.Buffer
 	b.WriteString(patchMagic)
-	b.WriteByte(formatVersion)
-	b.WriteByte(byte(removedPayloadChain))
+	b.WriteByte(byte(legacyFormatVersion))
+	b.WriteByte(byte(PayloadChunk))
 	b.Write([]byte{0, 0, 0, 0}) // patchVersion
 
 	_, err := DecodeRelease(b.Bytes())
 	if err == nil {
-		t.Fatal("chain 制品应被拒绝")
+		t.Fatal("旧线格式应被拒绝")
 	}
-	if !strings.Contains(err.Error(), "已移除") {
-		t.Fatalf("错误提示应说明后端已移除: %v", err)
+	if !strings.Contains(err.Error(), "旧格式") {
+		t.Fatalf("错误提示应说明是旧格式: %v", err)
 	}
 }

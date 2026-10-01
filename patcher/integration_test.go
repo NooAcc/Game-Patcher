@@ -44,7 +44,6 @@ func TestRealASARDeltaRoundTrip(t *testing.T) {
 	buildTime := time.Since(start)
 
 	rel := &Release{PatchVersion: 1, Payload: NewChunkPayload(
-		[]string{"old", "new"},
 		[]ChainStep{{SourceIndex: 1, Entries: []Entry{{
 			Path: "app.asar", Action: ActionUpdate,
 			OldHash: res.OldHash, NewHash: res.NewHash,

@@ -8,7 +8,6 @@ import (
 // SourceMismatch 记录某个候选源版本为何不匹配。
 type SourceMismatch struct {
 	VersionIndex uint32
-	Label        string
 	Reason       string
 }
 
@@ -34,7 +33,6 @@ func DetectSource(gameDir string, rel *Release) (int, []SourceMismatch, error) {
 		}
 		mismatches = append(mismatches, SourceMismatch{
 			VersionIndex: sources[i].Index,
-			Label:        sources[i].Label,
 			Reason:       reason,
 		})
 	}

@@ -159,13 +159,13 @@ restorer.exe
 ├────────────────────────────────────────────┤
 │  GPBIN4 制品                                │
 │    "GPBIN4"       6B                        │
-│    formatVersion  1B (=4)                   │
-│    payloadKind    1B (1=版本链)             │
+│    formatVersion  1B (=5)                   │
+│    payloadKind    1B (=2)                   │
 │    patchVersion   uint32 LE  补丁版本号      │
-│    versionCount   uint32 LE                 │
-│    VersionRef[]   各版本指纹（检测用）        │
 │    stepCount      uint32 LE                 │
 │    Step[]         每段 sourceIndex + Entry[]│
+│    chunkCount     uint32 LE  共享字面量块数   │
+│    Blob[]         comp+rawHash+len+data     │
 ├────────────────────────────────────────────┤
 │  blobLen          uint64 LE                 │
 │  "GPBIN4END!"     10B                       │
@@ -176,7 +176,10 @@ restorer.exe
 └────────────────────────────────────────────┘
 ```
 
-一个版本链由若干段组成，第 i 段表示"版本 i → 版本 i+1"的差异；每段由若干 `Entry` 组成，`Entry` 编码与此前一致。
+一个版本链由若干段组成，第 i 段表示"版本 i → 版本 i+1"的差异；每段由若干 `Entry` 组成。
+
+**版本只用链内序号标识（v1、v2、v3…），制品中不记录任何版本名称。** 应用端用于识别版本的
+指纹（各版本下被触及文件的存在性 / 大小 / BLAKE3）由各段的 old/new 哈希回放推导，不占存储。
 
 每个 `Entry`：
 
@@ -191,10 +194,15 @@ opCount uint32
 Op[]
 ```
 
-每个 `Op`：
+每个 `Op`（`kind uint8` 开头）：
 
-- `COPY`：`oldOffset uint64 + length uint64`，从旧文件复制区段；
-- `LITERAL`：`comp uint8 + rawLen uint64 + dataLen uint64 + data`，`comp=0` 原始、`comp=1` flate 压缩。
+- `COPY`(=1)：`oldOffset uint64 + length uint64`，从**该文件**的旧内容复制区段；
+- `LITERAL`(=2)：`comp uint8 + rawLen uint64 + dataLen uint64 + data`，内联字面量（应用器支持，当前构建器统一改用 `POOLREF`）；
+- `COPYFROM`(=3)：`srcPath + oldOffset uint64 + length uint64`，从**同一版本树中的另一个文件**复制区段，用于复用"本段被删除文件"的块；
+- `POOLREF`(=4)：`poolIndex uint32 + length uint64`，引用共享字面量池中的块。
+
+每个 `Blob`：`comp uint8 + rawHash[32] + rawLen uint64 + dataLen uint64 + data`。
+块池按 `rawHash`（原始内容的 BLAKE3）去重，因此同一份内容在多段中出现时只存一份。
 
 ## 差异算法
 
@@ -246,8 +254,8 @@ go test ./...          # 含 test/app.asar(.orig) 的真实集成与端到端 EX
 
 ## 兼容性
 
-- 当前版本使用 `GPBIN4` 链式制品格式（支持多版本）。
-- 制品以 `payloadKind` 标识差异格式（2=当前格式）；已移除的 chain 后端（1）会被明确拒绝并提示重新生成。
+- 当前版本使用 `GPBIN4` 链式制品格式（支持多版本），线格式版本 `formatVersion=5`。
+- 读到 `formatVersion=4` 的旧制品会被明确拒绝并提示用当前 CLI 重新生成（旧版会写入版本名称字段）。
 - **不兼容** `GPBIN3` / `GPBIN2` 生成的旧补丁（已发布的旧 EXE 自带旧代码不受影响，但新 CLI 无法把旧补丁作为 `-prev` 读取）；`GAMEPATCH1` 同样不再支持。
 - 仅支持目录模式：`-old` / `-new` 必须是目录。
 - `restore.json` 与恢复工具的契约保持不变：`add` = 删除新增文件，`update`/`delete` = 从备份还原。

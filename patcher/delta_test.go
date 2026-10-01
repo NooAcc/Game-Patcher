@@ -107,7 +107,6 @@ func TestChunkDeltaIdenticalUsesMergedCopy(t *testing.T) {
 	}
 
 	rel := &Release{PatchVersion: 1, Payload: NewChunkPayload(
-		[]string{"old", "new"},
 		[]ChainStep{{SourceIndex: 1, Entries: []Entry{{
 			Path: "x.bin", Action: ActionUpdate, OldHash: res.OldHash, NewHash: res.NewHash,
 			OldSize: res.OldSize, NewSize: res.NewSize, Ops: res.Ops,

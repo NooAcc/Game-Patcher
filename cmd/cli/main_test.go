@@ -126,11 +126,80 @@ func TestResolvePrevPatches(t *testing.T) {
 	if len(got) != 1 || got[0] != want {
 		t.Fatalf("resolvePrevPatches = %v，期望 [%s]", got, want)
 	}
+	quoted, err := resolvePrevPatches([]string{"\"" + fix + "\""})
+	if err != nil {
+		t.Fatalf("带双引号的路径应被接受: %v", err)
+	}
+	if len(quoted) != 1 || quoted[0] != want {
+		t.Fatalf("带双引号的路径解析 = %v，期望 [%s]", quoted, want)
+	}
 
 	if _, err := resolvePrevPatches([]string{filepath.Join(dir, "missing.exe")}); err == nil {
 		t.Fatal("不存在的旧补丁应返回错误")
 	}
 	if _, err := resolvePrevPatches([]string{dir}); err == nil {
 		t.Fatal("目录作为旧补丁应返回错误")
+	}
+}
+
+func TestCleanPath(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"\"C:/Games/My Game\"", "C:/Games/My Game"},
+		{"   \"C:/Games/My Game\"   ", "C:/Games/My Game"},
+		{"C:/Games/My Game", "C:/Games/My Game"},
+		{"\"C:/Games/My Game", "\"C:/Games/My Game"},
+		{"\"\"", ""},
+		{"\"a\"b\"", "a\"b"},
+	}
+	for _, c := range cases {
+		if got := cleanPath(c.in); got != c.want {
+			t.Fatalf("cleanPath(%q) = %q，期望 %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestSplitPathListIgnoresCommasInsideQuotes(t *testing.T) {
+	got := splitPathList("\"D:/Games, Inc/v1.exe\",E:/v2.exe")
+	want := []string{"\"D:/Games, Inc/v1.exe\"", "E:/v2.exe"}
+	if len(got) != len(want) {
+		t.Fatalf("splitPathList = %q，期望 %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("splitPathList[%d] = %q，期望 %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestStringListAcceptsQuotedCommaPaths(t *testing.T) {
+	var s stringList
+	if err := s.Set("\"D:/Games, Inc/v1.exe\", E:/v2.exe"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"D:/Games, Inc/v1.exe", "E:/v2.exe"}
+	if len(s) != len(want) {
+		t.Fatalf("stringList = %q，期望 %q", s, want)
+	}
+	for i := range want {
+		if s[i] != want[i] {
+			t.Fatalf("stringList[%d] = %q，期望 %q", i, s[i], want[i])
+		}
+	}
+}
+
+func TestPromptPathAcceptsQuotedPath(t *testing.T) {
+	dir := tempWorkDir(t)
+	want, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 模拟从资源管理器复制目录地址：外层带双引号，前后还有空白与一个空行
+	r := bufio.NewReader(strings.NewReader("\n   \"" + dir + "\"   \n"))
+	got, err := promptPath(r, "旧版本文件夹路径")
+	if err != nil {
+		t.Fatalf("promptPath 返回错误: %v", err)
+	}
+	if got != want {
+		t.Fatalf("promptPath = %q，期望 %q", got, want)
 	}
 }

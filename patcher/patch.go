@@ -127,8 +127,8 @@ func printReleaseSummary(gameDir string, rel *Release) {
 
 // versionDisplay 把版本序号渲染为面向用户的 v1/v2/v3。
 //
-// 制品里仍保留每个版本的 Label（构建时的目录名）作为溯源信息，但它不再出现在
-// 面向玩家的输出中：目录名可能很长或带路径信息，而链内序号才是稳定的版本标识。
+// 补丁只用链内序号标识版本：不同版本的游戏目录名差异很大，记录名称既无判定价值
+// 也无显示价值，因此制品里根本不存目录名。
 func versionDisplay(index uint32) string {
 	return fmt.Sprintf("v%d", index)
 }

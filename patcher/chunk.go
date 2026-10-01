@@ -7,28 +7,27 @@ import (
 
 const minChunkEncodedSize = 1 + 32 + 8 + 8 // comp + rawHash + rawLen + dataLen
 
-// ChunkPayload 是补丁的唯一差异后端：版本链 + 共享字面量池 + 跨文件块复用。
+// ChunkPayload 是补丁的差异数据：版本链 + 共享字面量池 + 跨文件块复用。
 //
 //   - 版本链决定"能从哪些版本升级到目标版本"，并由各段回放推导出检测指纹；
 //   - 所有段的字面量统一放进去重的 Pool，条目以 OpPoolRef 引用；
 //   - 同一段内，新增/修改文件可复用"本段被删除文件"的块（OpCopyFrom），
 //     因此重命名/移动大文件时不再整块存储。
 type ChunkPayload struct {
-	Labels []string
-	Steps  []ChainStep
-	Pool   []Blob
+	Steps []ChainStep
+	Pool  []Blob
 }
 
 // NewChunkPayload 组装一个补丁后端。
-func NewChunkPayload(labels []string, steps []ChainStep, pool []Blob) *ChunkPayload {
-	return &ChunkPayload{Labels: labels, Steps: steps, Pool: pool}
+func NewChunkPayload(steps []ChainStep, pool []Blob) *ChunkPayload {
+	return &ChunkPayload{Steps: steps, Pool: pool}
 }
 
 func (c *ChunkPayload) Kind() PayloadKind { return PayloadChunk }
 
 // Sources 返回按版本升序排列的版本指纹（含最终目标版本）。
 func (c *ChunkPayload) Sources() []VersionRef {
-	return deriveVersionRefs(c.Labels, c.Steps)
+	return deriveVersionRefs(c.Steps)
 }
 
 // Target 返回最终目标版本的指纹。
@@ -58,7 +57,7 @@ func (c *ChunkPayload) StagesFrom(sourceIdx int) []Stage {
 
 // SelfCheck 校验版本链结构，并确认所有块池引用与跨文件源都在合法范围内。
 func (c *ChunkPayload) SelfCheck() error {
-	if err := checkSteps(c.Labels, c.Steps); err != nil {
+	if err := checkSteps(c.Steps); err != nil {
 		return err
 	}
 	for i := range c.Steps {
@@ -90,7 +89,7 @@ func (c *ChunkPayload) Encode(w io.Writer) error {
 		return err
 	}
 	e := &encWriter{w: w}
-	encodeSteps(e, c.Labels, c.Steps)
+	encodeSteps(e, c.Steps)
 	e.u32(uint32(len(c.Pool)))
 	for i := range c.Pool {
 		b := &c.Pool[i]
@@ -108,7 +107,7 @@ func (c *ChunkPayload) Encode(w io.Writer) error {
 }
 
 func decodeChunkPayload(d *decoder) (*ChunkPayload, error) {
-	labels, steps, err := decodeSteps(d)
+	steps, err := decodeSteps(d)
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +150,7 @@ func decodeChunkPayload(d *decoder) (*ChunkPayload, error) {
 		pool = append(pool, Blob{Hash: rawHash, Comp: CompMethod(comp), RawLen: rawLen, Data: data})
 	}
 
-	cp := &ChunkPayload{Labels: labels, Steps: steps, Pool: pool}
+	cp := &ChunkPayload{Steps: steps, Pool: pool}
 	if err := cp.SelfCheck(); err != nil {
 		return nil, err
 	}
