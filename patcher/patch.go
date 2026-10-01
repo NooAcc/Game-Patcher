@@ -28,17 +28,17 @@ func RunEmbedded(exePath string) error {
 	case idx < 0:
 		fmt.Println("❌ 未能识别当前游戏版本：")
 		for _, m := range mismatches {
-			fmt.Printf("   • %s: %s\n", versionLabelOf(m.Label, m.VersionIndex), m.Reason)
+			fmt.Printf("   • %s: %s\n", versionDisplay(m.VersionIndex), m.Reason)
 		}
 		fmt.Println()
 		return fmt.Errorf("游戏版本与补丁不匹配，已中止（未修改任何文件）")
 	case idx == len(sources)-1:
-		fmt.Printf("✅ 当前已经是最新版本（%s），无需升级。\n", versionLabelOf(sources[idx].Label, sources[idx].Index))
+		fmt.Printf("✅ 当前已经是最新版本（%s），无需升级。\n", versionDisplay(sources[idx].Index))
 		return nil
 	}
 
-	fmt.Printf("🔎 检测到当前版本: %s\n", versionLabelOf(sources[idx].Label, sources[idx].Index))
-	fmt.Printf("🎯 目标版本: %s\n", versionLabelOf(sources[len(sources)-1].Label, sources[len(sources)-1].Index))
+	fmt.Printf("🔎 检测到当前版本: %s\n", versionDisplay(sources[idx].Index))
+	fmt.Printf("🎯 目标版本: %s\n", versionDisplay(sources[len(sources)-1].Index))
 	fmt.Println()
 	fmt.Print("确认升级? (Y/n): ")
 	var answer string
@@ -111,23 +111,24 @@ func releaseRestorer(exePath, backupDir string) {
 
 func printReleaseSummary(gameDir string, rel *Release) {
 	sources := rel.Payload.Sources()
-	labels := make([]string, 0, len(sources))
+	chain := make([]string, 0, len(sources))
 	for i := range sources {
-		labels = append(labels, versionLabelOf(sources[i].Label, sources[i].Index))
+		chain = append(chain, versionDisplay(sources[i].Index))
 	}
 	fmt.Println("╔══════════════════════════════════════╗")
 	fmt.Println("║       🎮 游戏升级工具                ║")
 	fmt.Println("╚══════════════════════════════════════╝")
 	fmt.Println()
 	fmt.Printf("📂 目标目录: %s\n", gameDir)
-	fmt.Printf("🏷️  补丁版本: v%d  版本链: %s\n", rel.PatchVersion, strings.Join(labels, " → "))
-	fmt.Printf("📊 可从 %d 个已知版本升级到 %s\n", len(sources)-1, labels[len(labels)-1])
+	fmt.Printf("🏷️  补丁版本: v%d  版本链: %s\n", rel.PatchVersion, strings.Join(chain, " → "))
+	fmt.Printf("📊 可从 %d 个已知版本升级到 %s\n", len(sources)-1, chain[len(chain)-1])
 	fmt.Println()
 }
 
-func versionLabelOf(label string, index uint32) string {
-	if strings.TrimSpace(label) != "" {
-		return label
-	}
+// versionDisplay 把版本序号渲染为面向用户的 v1/v2/v3。
+//
+// 制品里仍保留每个版本的 Label（构建时的目录名）作为溯源信息，但它不再出现在
+// 面向玩家的输出中：目录名可能很长或带路径信息，而链内序号才是稳定的版本标识。
+func versionDisplay(index uint32) string {
 	return fmt.Sprintf("v%d", index)
 }
