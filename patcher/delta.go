@@ -102,77 +102,6 @@ type deltaResult struct {
 	Ops     []DeltaOp
 }
 
-// buildDelta 生成把 oldPath 重建为 newPath 的差异操作。
-func buildDelta(oldPath, newPath string) (*deltaResult, error) {
-	index, oldSize, oldHash, err := indexChunks(oldPath)
-	if err != nil {
-		return nil, fmt.Errorf("扫描旧文件失败: %w", err)
-	}
-
-	newFile, err := os.Open(newPath)
-	if err != nil {
-		return nil, fmt.Errorf("打开新文件失败: %w", err)
-	}
-	defer newFile.Close()
-
-	hasher := blake3.New()
-	sc := newChunkScanner(io.TeeReader(newFile, hasher))
-
-	var ops []DeltaOp
-	var literal []byte
-	flushLiteral := func() error {
-		if len(literal) == 0 {
-			return nil
-		}
-		comp, payload := compressLiteral(literal)
-		ops = append(ops, DeltaOp{Kind: OpLiteral, Length: uint64(len(literal)), Comp: comp, Data: payload})
-		literal = literal[:0]
-		return nil
-	}
-
-	var newSize uint64
-	for {
-		ch, err := sc.next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("扫描新文件失败: %w", err)
-		}
-		newSize += uint64(len(ch))
-
-		sum := blake3.Sum256(ch)
-		ref, ok := index[sum]
-		if ok && ref.size == len(ch) {
-			if err := flushLiteral(); err != nil {
-				return nil, err
-			}
-			appendCopyOp(&ops, ref.offset, uint64(len(ch)))
-			continue
-		}
-		literal = append(literal, ch...)
-		if len(literal) >= maxLiteralRun {
-			if err := flushLiteral(); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	if err := flushLiteral(); err != nil {
-		return nil, err
-	}
-
-	var newHash [32]byte
-	copy(newHash[:], hasher.Sum(nil))
-	return &deltaResult{
-		OldHash: oldHash,
-		NewHash: newHash,
-		OldSize: oldSize,
-		NewSize: newSize,
-		Ops:     ops,
-	}, nil
-}
-
 // indexChunks 为旧文件建立 分块哈希 -> 偏移 索引，同时计算整文件哈希。
 func indexChunks(path string) (map[[32]byte]chunkRef, uint64, [32]byte, error) {
 	var sum [32]byte
@@ -219,32 +148,6 @@ func appendCopyOp(ops *[]DeltaOp, oldOffset, length uint64) {
 	*ops = append(*ops, DeltaOp{Kind: OpCopy, OldOffset: oldOffset, Length: length})
 }
 
-// buildLiteralOps 把一个完整文件编码为 LITERAL 操作（用于 ADD）。
-func buildLiteralOps(path string) ([]DeltaOp, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	buf := make([]byte, maxLiteralRun)
-	var ops []DeltaOp
-	for {
-		n, err := io.ReadFull(f, buf)
-		if n > 0 {
-			comp, payload := compressLiteral(buf[:n])
-			ops = append(ops, DeltaOp{Kind: OpLiteral, Length: uint64(n), Comp: comp, Data: payload})
-		}
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-	}
-	return ops, nil
-}
-
 func compressLiteral(raw []byte) (CompMethod, []byte) {
 	var buf bytes.Buffer
 	w, err := flate.NewWriter(&buf, flate.BestCompression)
@@ -258,8 +161,15 @@ func compressLiteral(raw []byte) (CompMethod, []byte) {
 	return CompRaw, append([]byte(nil), raw...)
 }
 
-// applyDelta 将 ops 应用到 oldPath，结果写入 dst。oldPath 为空表示全部是 LITERAL。
-func applyDelta(oldPath string, ops []DeltaOp, dst io.Writer) error {
+// opContext 为需要额外上下文（跨文件源、共享块池）的操作提供解析环境。
+type opContext struct {
+	gameDir string
+	pool    []Blob
+}
+
+// applyOps 将 ops 应用到 oldPath，结果写入 dst。
+// oldPath 为空表示没有本文件的旧内容可复制（新增文件）。
+func applyOps(ctx opContext, oldPath string, ops []DeltaOp, dst io.Writer) error {
 	var (
 		oldFile *os.File
 		oldSize uint64
@@ -293,23 +203,70 @@ func applyDelta(oldPath string, ops []DeltaOp, dst io.Writer) error {
 				return fmt.Errorf("复制旧文件区段失败: %w", err)
 			}
 		case OpLiteral:
-			r, err := literalReader(op)
-			if err != nil {
-				return err
-			}
-			n, err := io.Copy(dst, io.LimitReader(r, int64(op.Length)+1))
-			if closer, ok := r.(io.Closer); ok {
-				closer.Close()
-			}
-			if err != nil {
+			if err := copyLiteral(&DeltaOp{Kind: OpLiteral, Comp: op.Comp, Data: op.Data, Length: op.Length}, dst); err != nil {
 				return fmt.Errorf("写入字面量失败: %w", err)
 			}
-			if uint64(n) != op.Length {
-				return fmt.Errorf("字面量长度不匹配: 期望 %d，实际 %d", op.Length, n)
+		case OpCopyFrom:
+			if err := copyFromFile(ctx, op, dst); err != nil {
+				return err
+			}
+		case OpPoolRef:
+			if int(op.PoolIndex) >= len(ctx.pool) {
+				return fmt.Errorf("块池引用越界: %d（池大小 %d）", op.PoolIndex, len(ctx.pool))
+			}
+			blob := &ctx.pool[op.PoolIndex]
+			if err := copyLiteral(&DeltaOp{Kind: OpLiteral, Comp: blob.Comp, Data: blob.Data, Length: op.Length}, dst); err != nil {
+				return fmt.Errorf("写入块池数据失败: %w", err)
 			}
 		default:
 			return fmt.Errorf("非法操作类型: %d", op.Kind)
 		}
+	}
+	return nil
+}
+
+func copyLiteral(op *DeltaOp, dst io.Writer) error {
+	r, err := literalReader(op)
+	if err != nil {
+		return err
+	}
+	n, err := io.Copy(dst, io.LimitReader(r, int64(op.Length)+1))
+	if closer, ok := r.(io.Closer); ok {
+		closer.Close()
+	}
+	if err != nil {
+		return err
+	}
+	if uint64(n) != op.Length {
+		return fmt.Errorf("长度不匹配: 期望 %d，实际 %d", op.Length, n)
+	}
+	return nil
+}
+
+func copyFromFile(ctx opContext, op *DeltaOp, dst io.Writer) error {
+	if ctx.gameDir == "" {
+		return fmt.Errorf("跨文件复制缺少游戏目录上下文")
+	}
+	src, err := SafeJoin(ctx.gameDir, op.SrcPath)
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("打开跨文件复制源 %s 失败: %w", op.SrcPath, err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	size := uint64(fi.Size())
+	if op.OldOffset > size || op.Length > size-op.OldOffset {
+		return fmt.Errorf("跨文件 COPY 越界: %s offset=%d length=%d size=%d", op.SrcPath, op.OldOffset, op.Length, size)
+	}
+	sr := io.NewSectionReader(f, int64(op.OldOffset), int64(op.Length))
+	if _, err := io.CopyN(dst, sr, int64(op.Length)); err != nil {
+		return fmt.Errorf("跨文件复制 %s 失败: %w", op.SrcPath, err)
 	}
 	return nil
 }

@@ -37,8 +37,45 @@ func copyTree(t *testing.T, src, dst string) {
 	}
 }
 
+func assertFileContent(t *testing.T, path, want string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取 %s 失败: %v", path, err)
+	}
+	if string(data) != want {
+		t.Fatalf("%s 内容 = %q, want %q", path, data, want)
+	}
+}
+
+// buildSingleStepPayload 扫描两个目录并生成一份完整的单段补丁（含共享块池）。
+func buildSingleStepPayload(t *testing.T, oldDir, newDir string) *ChunkPayload {
+	t.Helper()
+	jobs, err := planStep(oldDir, newDir, "")
+	if err != nil {
+		t.Fatalf("planStep 失败: %v", err)
+	}
+	pool := newBlobPool()
+	entries, err := buildChunkStepEntries(oldDir, newDir, jobs, pool)
+	if err != nil {
+		t.Fatalf("buildChunkStepEntries 失败: %v", err)
+	}
+	if len(entries) != len(jobs) {
+		t.Fatalf("条目数 %d 与变更数 %d 不一致", len(entries), len(jobs))
+	}
+	payload := NewChunkPayload(
+		[]string{versionLabel(oldDir), versionLabel(newDir)},
+		[]ChainStep{{SourceIndex: 1, Entries: entries}},
+		pool.blobs,
+	)
+	if err := payload.SelfCheck(); err != nil {
+		t.Fatalf("补丁自检失败: %v", err)
+	}
+	return payload
+}
+
 func TestTreePatchApplyAndRestore(t *testing.T) {
-	root := t.TempDir()
+	root := tempWorkDir(t)
 	oldDir := filepath.Join(root, "old")
 	newDir := filepath.Join(root, "new")
 	gameDir := filepath.Join(root, "game")
@@ -50,30 +87,18 @@ func TestTreePatchApplyAndRestore(t *testing.T) {
 	writeTestFile(t, newDir, "mod.txt", []byte("new content, much longer than before"))
 	writeTestFile(t, newDir, "add.txt", []byte("brand new file"))
 
-	patch, err := buildTreePatch(oldDir, newDir, "")
-	if err != nil {
-		t.Fatalf("buildTreePatch 失败: %v", err)
-	}
-	if len(patch.Entries) != 3 {
-		t.Fatalf("应有 3 个变更条目，实际 %d", len(patch.Entries))
+	payload := buildSingleStepPayload(t, oldDir, newDir)
+	if n := len(payload.Steps[0].Entries); n != 3 {
+		t.Fatalf("应有 3 个变更条目，实际 %d", n)
 	}
 
 	copyTree(t, oldDir, gameDir)
 	backupDir := filepath.Join(gameDir, backupDirName)
-	if err := os.MkdirAll(backupDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	manifest, err := backupAndVerify(gameDir, backupDir, patch)
+	manifest, err := ApplyRelease(gameDir, backupDir, payload.StagesFrom(0))
 	if err != nil {
-		t.Fatalf("backupAndVerify 失败: %v", err)
+		t.Fatalf("ApplyRelease 失败: %v", err)
 	}
-	if err := saveRestoreManifest(backupDir, manifest); err != nil {
-		t.Fatal(err)
-	}
-	if err := applyPatch(gameDir, patch); err != nil {
-		t.Fatalf("applyPatch 失败: %v", err)
-	}
-	if errs := verifyPatch(gameDir, patch); len(errs) != 0 {
+	if errs := verifyStates(gameDir, payload.Target().Files); len(errs) != 0 {
 		t.Fatalf("升级后校验失败: %v", errs)
 	}
 	assertFileContent(t, filepath.Join(gameDir, "mod.txt"), "new content, much longer than before")
@@ -92,19 +117,8 @@ func TestTreePatchApplyAndRestore(t *testing.T) {
 	}
 }
 
-func assertFileContent(t *testing.T, path, want string) {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("读取 %s 失败: %v", path, err)
-	}
-	if string(data) != want {
-		t.Fatalf("%s 内容 = %q, want %q", path, data, want)
-	}
-}
-
 func TestCreatePatchExecutableLayout(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempWorkDir(t)
 	base := randomBytes(4096, 11)
 	baseExe := writeTestFile(t, dir, "base.exe", base)
 
@@ -113,7 +127,7 @@ func TestCreatePatchExecutableLayout(t *testing.T) {
 	oldData := randomBytes(300<<10, 12)
 	newData := append([]byte(nil), oldData...)
 	newData = append(newData, randomBytes(20<<10, 13)...)
-	oldPath := writeTestFile(t, oldDir, "target.bin", oldData)
+	writeTestFile(t, oldDir, "target.bin", oldData)
 	writeTestFile(t, newDir, "target.bin", newData)
 	outPath := filepath.Join(dir, "update.exe")
 
@@ -129,34 +143,32 @@ func TestCreatePatchExecutableLayout(t *testing.T) {
 		t.Fatal("生成的升级工具应以基础 EXE 开头")
 	}
 
-	f, err := os.Open(outPath)
+	rel, err := readEmbeddedRelease(outPath)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("readEmbeddedRelease 失败: %v", err)
 	}
-	defer f.Close()
-	fi, _ := f.Stat()
-	off, length, err := findPatchTail(f, fi.Size())
-	if err != nil {
-		t.Fatalf("findPatchTail 失败: %v", err)
+	if rel.PatchVersion != 1 {
+		t.Fatalf("单段补丁版本号应为 1，实际 %d", rel.PatchVersion)
 	}
-	blob := make([]byte, length)
-	if _, err := f.ReadAt(blob, off); err != nil {
-		t.Fatal(err)
+	if len(rel.Payload.Steps) != 1 || len(rel.Payload.Steps[0].Entries) != 1 {
+		t.Fatalf("补丁结构不符合预期: %+v", rel.Payload)
 	}
-	patch, err := DecodePatch(blob)
-	if err != nil {
-		t.Fatalf("DecodePatch 失败: %v", err)
-	}
-	if len(patch.Entries) != 1 || patch.Entries[0].Path != "target.bin" {
-		t.Fatalf("补丁内容不符合预期: %+v", patch)
+	entry := rel.Payload.Steps[0].Entries[0]
+	if entry.Path != "target.bin" || entry.Action != ActionUpdate {
+		t.Fatalf("补丁条目不符合预期: %+v", entry)
 	}
 
-	var rebuilt bytes.Buffer
-	if err := applyDelta(oldPath, patch.Entries[0].Ops, &rebuilt); err != nil {
+	gameDir := filepath.Join(dir, "game")
+	copyTree(t, oldDir, gameDir)
+	if _, err := ApplyRelease(gameDir, filepath.Join(gameDir, backupDirName), rel.Payload.StagesFrom(0)); err != nil {
+		t.Fatalf("应用失败: %v", err)
+	}
+	rebuilt, err := os.ReadFile(filepath.Join(gameDir, "target.bin"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(rebuilt.Bytes(), newData) {
-		t.Fatal("使用补丁布局中的操作重建失败")
+	if !bytes.Equal(rebuilt, newData) {
+		t.Fatal("重建内容与目标不一致")
 	}
 
 	if !HasEmbeddedPatch(outPath) {
@@ -165,7 +177,7 @@ func TestCreatePatchExecutableLayout(t *testing.T) {
 }
 
 func TestCreatePatchWithRestorerTrailer(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempWorkDir(t)
 	baseExe := writeTestFile(t, dir, "base.exe", randomBytes(2048, 21))
 	oldDir := filepath.Join(dir, "old")
 	newDir := filepath.Join(dir, "new")
@@ -190,42 +202,33 @@ func TestCreatePatchWithRestorerTrailer(t *testing.T) {
 	}
 }
 
-func TestBackupAndVerifyRejectsWrongSource(t *testing.T) {
-	dir := t.TempDir()
+func TestVerifyStageSourceRejectsWrongSource(t *testing.T) {
+	dir := tempWorkDir(t)
 	gameDir := filepath.Join(dir, "game")
-	backupDir := filepath.Join(gameDir, backupDirName)
 	writeTestFile(t, gameDir, "app.bin", []byte("unexpected content"))
-	if err := os.MkdirAll(backupDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	patch := &Patch{Entries: []Entry{{
+	entries := []Entry{{
 		Path: "app.bin", Action: ActionUpdate,
 		OldHash: HashBytes([]byte("expected content")),
 		NewHash: HashBytes([]byte("new")),
 		OldSize: 16, NewSize: 3,
 		Ops: []DeltaOp{{Kind: OpLiteral, Length: 3, Comp: CompRaw, Data: []byte("new")}},
-	}}}
-	if _, err := backupAndVerify(gameDir, backupDir, patch); err == nil {
+	}}
+	if err := verifyStageSource(gameDir, entries); err == nil {
 		t.Fatal("源版本不匹配时应返回错误")
 	}
 }
 
-func TestBackupAndVerifyWrongSourceMessage(t *testing.T) {
-	dir := t.TempDir()
+func TestVerifyStageSourceWrongSourceMessage(t *testing.T) {
+	dir := tempWorkDir(t)
 	gameDir := filepath.Join(dir, "game")
-	backupDir := filepath.Join(gameDir, backupDirName)
 	writeTestFile(t, gameDir, "app.bin", []byte("unexpected content"))
-	if err := os.MkdirAll(backupDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	patch := &Patch{Entries: []Entry{{
+	entries := []Entry{{
 		Path: "app.bin", Action: ActionUpdate,
 		OldHash: HashBytes([]byte("expected content")),
 		NewHash: HashBytes([]byte("new")),
 		OldSize: 16, NewSize: 3,
-		Ops: []DeltaOp{{Kind: OpLiteral, Length: 3, Comp: CompRaw, Data: []byte("new")}},
-	}}}
-	_, err := backupAndVerify(gameDir, backupDir, patch)
+	}}
+	err := verifyStageSource(gameDir, entries)
 	if err == nil {
 		t.Fatal("源版本不匹配时应返回错误")
 	}
@@ -234,23 +237,33 @@ func TestBackupAndVerifyWrongSourceMessage(t *testing.T) {
 	}
 }
 
-func TestBackupAndVerifyMissingFileMessage(t *testing.T) {
-	dir := t.TempDir()
+func TestVerifyStageSourceMissingFileMessage(t *testing.T) {
+	dir := tempWorkDir(t)
 	gameDir := filepath.Join(dir, "game")
-	backupDir := filepath.Join(gameDir, backupDirName)
-	if err := os.MkdirAll(backupDir, 0755); err != nil {
+	if err := os.MkdirAll(gameDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	patch := &Patch{Entries: []Entry{{
+	entries := []Entry{{
 		Path: "app.bin", Action: ActionDelete,
 		OldHash: HashBytes([]byte("old")),
 		OldSize: 3,
-	}}}
-	_, err := backupAndVerify(gameDir, backupDir, patch)
+	}}
+	err := verifyStageSource(gameDir, entries)
 	if err == nil {
 		t.Fatal("文件缺失时应返回错误")
 	}
 	if !strings.Contains(err.Error(), "文件不存在") || !strings.Contains(err.Error(), "游戏版本不一致") {
 		t.Fatalf("文件缺失提示不符合预期: %v", err)
+	}
+}
+
+func TestVerifyStageSourceRejectsExistingAddTarget(t *testing.T) {
+	dir := tempWorkDir(t)
+	gameDir := filepath.Join(dir, "game")
+	writeTestFile(t, gameDir, "app.bin", []byte("already here"))
+	entries := []Entry{{Path: "app.bin", Action: ActionAdd}}
+	err := verifyStageSource(gameDir, entries)
+	if err == nil || !strings.Contains(err.Error(), "已存在") {
+		t.Fatalf("已存在的目标应被拒绝: %v", err)
 	}
 }

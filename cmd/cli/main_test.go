@@ -2,10 +2,31 @@ package main
 
 import (
 	"bufio"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+// tempWorkDir 创建带容错清理的临时目录。
+// Windows 上 t.TempDir() 的清理会与刚写入文件的句柄释放产生竞态而偶发失败。
+func tempWorkDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "gp-cli-test-*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	t.Cleanup(func() {
+		for i := 0; i < 5; i++ {
+			if err := os.RemoveAll(dir); err == nil {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	})
+	return dir
+}
 
 func TestLaunchedByDoubleClick(t *testing.T) {
 	cases := []struct {
@@ -41,7 +62,7 @@ func TestPromptPathErrorsOnEOF(t *testing.T) {
 }
 
 func TestPromptPathRetriesUntilValid(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempWorkDir(t)
 	want, err := filepath.Abs(dir)
 	if err != nil {
 		t.Fatalf("filepath.Abs: %v", err)
@@ -63,5 +84,53 @@ func TestPromptOutputDefaultsOnEmptyInput(t *testing.T) {
 	got := promptOutput(r, selfPath)
 	if got != want {
 		t.Fatalf("promptOutput = %q, 期望 %q", got, want)
+	}
+}
+
+func TestStringListParsesRepeatableAndCommaSeparated(t *testing.T) {
+	var s stringList
+	if err := s.Set("a.exe,b.exe"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Set("c.exe"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Set(" , "); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"a.exe", "b.exe", "c.exe"}
+	if len(s) != len(want) {
+		t.Fatalf("stringList = %v，期望 %v", s, want)
+	}
+	for i := range want {
+		if s[i] != want[i] {
+			t.Fatalf("stringList[%d] = %q，期望 %q", i, s[i], want[i])
+		}
+	}
+}
+
+func TestResolvePrevPatches(t *testing.T) {
+	dir := tempWorkDir(t)
+	fix := filepath.Join(dir, "fix1.exe")
+	if err := os.WriteFile(fix, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.Abs(fix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolvePrevPatches([]string{fix})
+	if err != nil {
+		t.Fatalf("resolvePrevPatches 失败: %v", err)
+	}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("resolvePrevPatches = %v，期望 [%s]", got, want)
+	}
+
+	if _, err := resolvePrevPatches([]string{filepath.Join(dir, "missing.exe")}); err == nil {
+		t.Fatal("不存在的旧补丁应返回错误")
+	}
+	if _, err := resolvePrevPatches([]string{dir}); err == nil {
+		t.Fatal("目录作为旧补丁应返回错误")
 	}
 }
