@@ -210,7 +210,7 @@ Op[]
 - 旧文件按内容分块建立 `BLAKE3 → (offset,size)` 索引；
 - 新文件按相同规则分块，命中索引则生成 `COPY`，否则累计为 `LITERAL`；
 - 相邻且旧/新位置都连续的 `COPY` 自动合并；
-- LITERAL 段最大 4 MB，使用标准库 `compress/flate` 压缩，压缩无收益时存原始数据。
+- LITERAL 段最大 4 MB：构建端用 `klauspost/compress/flate`（标准 DEFLATE）压缩，压缩无收益时存原始数据。
 
 该方案内存有界（索引 + 分块缓冲），可流式处理大文件；对整段位移的 ASAR 包也能保持 99% 以上的 COPY 命中率。
 
@@ -265,7 +265,7 @@ go test ./...          # 含 test/app.asar(.orig) 的真实集成与端到端 EX
 
 - Go 1.25（纯 Go，无 CGO）
 - BLAKE3：`github.com/zeebo/blake3`
-- 压缩：标准库 `compress/flate`
+- 压缩：`klauspost/compress/flate`（构建端，标准 DEFLATE）；解压用标准库 `compress/flate` 并复用解压器
 - 目标平台：Windows amd64（代码同样可在其他平台构建运行）
 
 ## 许可证
