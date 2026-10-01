@@ -1,64 +1,67 @@
-# 计划：CDC 分块扫描器性能优化（纯 Go，行为不变）
+# 计划：压缩编解码器优化（编码器换 klauspost + 解码器复用）
 
 ## 1. 总体目标与范围
-- 目标：消除 `chunkScanner` 的逐字节 `bufio.Reader.ReadByte()` 热路径，改为**批式扫描**，在不改变分块结果的前提下提升吞吐。
-- 范围：`patcher/delta.go` 的 `chunkScanner`；新增等价性回归测试；性能验证。
-- 非目标：不改 CDC 参数/分块算法、不改补丁格式、不引入 C++/CGO、不动压缩策略（另行决策）。
-- 硬约束：**分块边界必须逐字节等价**，补丁产物必须与优化前完全一致。
+- 目标：解决 `compressLiteral` 使用 `flate.BestCompression` 导致的构建端瓶颈，并优化解码端。
+- 范围：`patcher/delta.go`（编码器、解压器复用）、`patcher/apply.go`（复用器传递）、
+  新增依赖 `github.com/klauspost/compress`、新增 `patcher/codec_test.go`。
+- 用户授权：**不需要对旧版本代码/数据做兼容，也不要冗余**。
+- 非目标：不改补丁线格式（本次**无需**升版本号）；不引入 CGO；不改 CDC 分块。
 
 ## 2. 当前阶段与进度
-- 阶段：**已完成**。进度 100%（实现、测试、性能验证、提交推送、CI 全部完成）。
+- 阶段：**已完成**。进度 100%（实现、测试、端到端验证完成；待提交推送）。
 
 ## 3. 详细执行步骤
-- [x] 测量基线：`chunkScanner` 522 MB/s；BLAKE3 5147 MB/s（排除哈希为瓶颈）
-- [x] 原型验证：批式扫描 ~1690 MB/s，端到端提速、产物一致
-- [x] 落地实现：重写 `chunkScanner`（1 MiB 块缓冲 + 索引内循环 + 跨块 pending）
-- [x] 移除不再使用的 `bufio` 导入；补充零进度读保护（`io.ErrNoProgress`，`maxZeroReads=100`）
-- [x] 新增 `patcher/chunk_scanner_test.go`：与逐字节参考实现逐块比对；覆盖空/小于 min/
-      跨 1 MiB 块/短读 reader/`(n>0, io.EOF)` 同返/`(0,nil)` 忙循环保护
-- [x] 内循环写法回归定位：3 分支 `for` + `continue` 使边界检查消除失效（1.15 vs 1.7 GB/s），
-      改为手动自增单层条件，并加注释锁定
-- [x] 全量验证：go vet / go build / cmd/cli 测试 / patcher 52 项测试全通过
-- [x] 真实 200MB 端到端复测（产物 SHA256 与优化前完全一致）
-- [x] 提交并推送（commit 9abd426）；CI run 36819791268 成功，发布 Release v20261001-132712
+- [x] 选型实测：编码器 klauspost L6（构建 11~30x），解码器**不换** klauspost（+51 KB/份仅换 1.27x）
+- [x] 解码器改用 `flate.Resetter` 复用（零体积成本，实测 1.2x），并验证读尽后可安全 Reset
+- [x] 引入 `github.com/klauspost/compress v1.20.1`；级别抽为具名常量 `literalCompressLevel = 6`
+- [x] 实现 `literalDecoder`（复用解压器），经 `opContext.literal` 传递；nil 时退化为一次性路径
+- [x] `ApplyRelease` 创建并 `defer close` 复用器；确认其串行执行，无需加锁
+- [x] 新增 `patcher/codec_test.go`：往返、分支选择、复用 vs 一次性等价（500 块）、
+      `applyOps` 混合复用、**解码出错后不污染后续块**
+- [x] gofmt / go vet / go build / cmd/cli / patcher 全量（**58 项，0 失败**）
+- [x] 真实端到端：30 MiB 新可压缩内容，构建 1.471s → 0.209s；产物可正常应用且文件校验通过
+- [x] 量化体积代价：升级器 +18 KB、恢复器 +13 KB（每份补丁 +31 KB）、CLI +74.5 KB
+- [ ] 更新 plan.md（本条）；提交并推送；确认 CI 绿
 
 ## 4. 已发现的问题与风险
-- **返回值生命周期契约**：`next()` 返回的切片"下次调用即失效"；批式实现会返回 `fill` 子切片。
-  已逐一核对三处调用方（`indexChunks`/`buildChunkFileEntry`/`crossIndex.addFile`）均在拿到后立即消费或拷贝。
-- **`Read` 同时返回 n>0 与 `io.EOF`**：合法但少见；已专门处理（先消费已读字节再收尾），并加测试。
-- **内循环写法陷阱（本次最大发现）**：语义等价的两处循环写法性能差 46%。已在代码内注释锁定，
-  并留下 `BenchmarkChunkScanner` 作为回归哨兵。
-- **短读**：单次 `Read` 可能小于缓冲区；跨块拼接已覆盖测试。
-- 本机安全策略限制：`patcher` 测试二进制需 `go test -c` 后手工执行（`cmd/cli` 不受影响）。
+- **`flate.Resetter` 语义依赖**：文档未明确"读尽后可 Reset"。已实测通过，并写了
+  `TestLiteralDecoderReuseMatchesOneShot`（500 块）与 `TestLiteralDecoderReuseAfterError` 固化。
+- **复用器是可变状态**：依赖 `ApplyRelease` 串行这一前提，已在代码注释中明确标注；
+  若将来并行应用，必须每 goroutine 一份。
+- **载荷变大**：文本类载荷约 +12%。整包影响取决于载荷占比（实测 +5.1% @ 30 MiB 新内容）。
+  级别已抽为常量，可回调到 8 换取更小载荷。
+- 依赖新增：`klauspost/compress`（纯 Go，无 CGO），已 `go mod tidy`。
 
 ## 5. 已做出的决策与优化记录
-- 保留 `chunkScanner` 类型名与 `newChunkScanner`/`next()` 签名 → 零调用方改动，降低回归面。
-- 单块内不跨界的块直接返回 `fill` 子切片（零拷贝）；跨块才走 `pending` 拼接。
-- 不改变 gear hash 更新式与 mask 判定顺序 → 保证切分逐字节等价。
-- 不以"语法更简洁"为由重构内循环：批式内循环保留手动自增形式（性能敏感，已注释说明）。
-- 不采用 C++/CGO：热点是 Go 层逐字节方法调用开销，纯 Go 即拿到 3.3x；CGO 会破坏静态单 EXE 发布模型。
+- **编码器**：`klauspost/compress/flate` L6，标准 DEFLATE → **零线格式变更、零兼容性分支**。
+- **解码器**：保留 stdlib `compress/flate`（体积最小）+ `Resetter` 复用；
+  拒绝 klauspost 解码器（+51 KB/份仅换 1.27x，不划算）。
+- **不升 formatVersion**：线格式未变，旧补丁仍可被新 CLI 读取；未加任何兼容/冗余分支。
+- 名称与语义保持：`compressLiteral` / `copyLiteral` 签名仅按需调整，`CompRaw`/`CompFlate` 不变。
 
 ## 6. 下一步行动
-- 无必做项。任务已完成：优化已合入 main，CI 成功并自动发布 Release。
-- 可选后续：压缩策略优化（late.BestCompression 仅 6.9 MB/s，属体积/速度权衡，需先决策）。
+1. 提交并推送
+2. 确认 CI 绿
 
 ## 7. 文件统计与进度追踪
-- 改动文件：`patcher/delta.go`（重写 chunkScanner）、新增 `patcher/chunk_scanner_test.go`、`plan.md`
-- 新增测试：4 个（等价性 / EOF 同返 / 空输入 / 忙循环保护）+ 1 个 benchmark
+- 改动：`patcher/delta.go`、`patcher/apply.go`、`go.mod`、`go.sum`、新增 `patcher/codec_test.go`、`plan.md`
+- 测试：58 项全通过（新增 6 项编解码测试）
 
-### 性能结果（Ryzen 5 9600X，12 线程）
+### 实测结果（Ryzen 5 9600X）
 | 指标 | 优化前 | 优化后 | 提升 |
 |---|---|---|---|
-| 扫描吞吐（64MB 基准） | 522 MB/s | **1722 MB/s** | **3.3x** |
-| 200MB 内部 diff 阶段 | 1225 ms | **~720 ms** | 1.70x |
-| 200MB 端到端（含嵌入+写盘） | 1.35 s | **0.73 s** | 1.85x |
-| 产物 SHA256 | — | **完全一致** | 行为零变化 |
+| 构建端压缩吞吐（30 MiB 文本） | 25.8 MB/s | **285.7 MB/s** | **11.1x** |
+| 端到端构建（30 MiB 新内容） | 1.471 s | **0.209 s** | **7.0x** |
+| 整包体积（同场景，未 strip 基线） | 13.59 MB | 14.28 MB | +5.1% |
+| 解码吞吐（复用 vs 每 op 新建） | 基准 | **1.2x** | — |
+| 每份补丁固定开销 | — | **+31 KB** | 可忽略 |
 
 - 完成度：100%
 
 ## 8. 变更日志
-- 2026-10-01 建立计划；完成基线测量（522 MB/s）与原型验证（1690 MB/s、产物一致）。
-- 2026-10-01 落地批式 `chunkScanner`；移除 `bufio`；补充零进度保护与等价性回归测试。
-- 2026-10-01 定位并修复内循环写法导致的 46% 性能回退（边界检查消除失效），加注释与基准哨兵锁定。
-- 2026-10-01 全量验证：52 项测试通过；200MB 端到端 1.35s → 0.73s，产物 SHA256 与优化前一致。
-- 2026-10-01 提交并推送（9abd426）；CI run 36819791268 成功，自动发布 Release v20261001-132712。任务完成。
+- 2026-10-01 建立计划；完成编码器/解码器选型实测（klauspost L6、Resetter 复用、拒绝 kp 解码器）。
+- 2026-10-01 验证 `flate.Resetter` 读尽后可安全 Reset；确认 `ApplyRelease` 串行可共享解压器。
+- 2026-10-01 落地实现：编码器换 klauspost L6、新增 literalDecoder 复用、ApplyRelease 串行共享。
+- 2026-10-01 新增 6 项编解码测试；全量 58 项通过；gofmt/vet/build 干净。
+- 2026-10-01 端到端实测：30 MiB 新内容构建 1.471s → 0.209s（7.0x），产物应用并校验通过；
+  每份补丁固定开销 +31 KB。

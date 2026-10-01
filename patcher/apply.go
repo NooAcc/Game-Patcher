@@ -115,8 +115,8 @@ func backupEntries(gameDir, backupDir string, entries []Entry, manifest *Restore
 //
 // 同一段内先执行新增/修改、最后执行删除：这样被删除的文件在读取阶段仍然存在，
 // 可以作为 OpCopyFrom 的源，从而让"重命名/移动"场景复用块而不必整块存储。
-func applyEntries(gameDir string, entries []Entry, pool []Blob) error {
-	ctx := opContext{gameDir: gameDir, pool: pool}
+func applyEntries(gameDir string, entries []Entry, pool []Blob, dec *literalDecoder) error {
+	ctx := opContext{gameDir: gameDir, pool: pool, literal: dec}
 	total := len(entries)
 
 	pass := func(deletes bool) error {
@@ -166,6 +166,11 @@ func ApplyRelease(gameDir, backupDir string, stages []Stage) (*RestoreManifest, 
 	manifest := &RestoreManifest{GameDir: gameDir}
 	recorded := make(map[string]bool)
 
+	// 整个应用过程复用同一个 DEFLATE 解压器，避免逐个区块重新分配滑动窗口。
+	// ApplyRelease 串行执行，因此该复用器无需加锁。
+	dec := &literalDecoder{}
+	defer dec.close()
+
 	for si := range stages {
 		st := &stages[si]
 		if err := verifyStageSource(gameDir, st.Entries); err != nil {
@@ -179,7 +184,7 @@ func ApplyRelease(gameDir, backupDir string, stages []Stage) (*RestoreManifest, 
 			return manifest, fmt.Errorf("写入恢复清单失败: %w", err)
 		}
 		fmt.Printf("   ▶ 应用第 %d/%d 段差异\n", si+1, len(stages))
-		if err := applyEntries(gameDir, st.Entries, st.Pool); err != nil {
+		if err := applyEntries(gameDir, st.Entries, st.Pool, dec); err != nil {
 			return manifest, fmt.Errorf("第 %d 段应用失败: %w", si+1, err)
 		}
 	}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 
+	kflate "github.com/klauspost/compress/flate"
 	"github.com/zeebo/blake3"
 )
 
@@ -210,9 +211,21 @@ func appendCopyOp(ops *[]DeltaOp, oldOffset, length uint64) {
 	*ops = append(*ops, DeltaOp{Kind: OpCopy, OldOffset: oldOffset, Length: length})
 }
 
+// literalCompressLevel 是构建端字面量的 DEFLATE 压缩级别。
+//
+// 用 klauspost/compress/flate 替代 stdlib 的 flate.BestCompression：构建端吞吐
+// 由 6~26 MB/s 提升到 200~290 MB/s，代价是载荷体积变大（文本类约 +12%）。
+// 对最终补丁的影响取决于载荷占比：
+//   - 载荷占比较小（普通版本升级）：整包约 +1~2.5%；
+//   - 载荷占比较大（新增大量可压缩资源）：实测 30 MiB 新内容时整包 +5.1%。
+//
+// 想换更小载荷可调高到 8（实测 1.8x 提速、载荷 +4.6%）；想更快可调低。
+// 注意 klauspost 的 L7 在文本类数据上比 L6 又慢又差，不建议选。
+const literalCompressLevel = 6
+
 func compressLiteral(raw []byte) (CompMethod, []byte) {
 	var buf bytes.Buffer
-	w, err := flate.NewWriter(&buf, flate.BestCompression)
+	w, err := kflate.NewWriter(&buf, literalCompressLevel)
 	if err == nil {
 		_, werr := w.Write(raw)
 		cerr := w.Close()
@@ -223,10 +236,46 @@ func compressLiteral(raw []byte) (CompMethod, []byte) {
 	return CompRaw, append([]byte(nil), raw...)
 }
 
-// opContext 为需要额外上下文（跨文件源、共享块池）的操作提供解析环境。
+// opContext 为需要额外上下文（跨文件源、共享块池、解压器复用）的操作提供解析环境。
 type opContext struct {
 	gameDir string
 	pool    []Blob
+	// literal 是可选的解压器复用器；为 nil 时每次解压都新建（测试与一次性路径）。
+	literal *literalDecoder
+}
+
+// literalDecoder 复用一个 DEFLATE 解压器，避免每个 op 都重新分配
+// 32 KiB 滑动窗口与哈夫曼表。
+//
+// 它不并发安全：调用方必须串行使用。当前唯一的生产调用方 ApplyRelease
+// 是串行执行的；若将来改为并行应用，需要每个 goroutine 各持一个实例。
+type literalDecoder struct {
+	rc  io.ReadCloser
+	res flate.Resetter
+}
+
+// reader 返回读取 data 的解压器，尽量复用底层状态。
+func (d *literalDecoder) reader(data []byte) (io.Reader, error) {
+	if d.res == nil {
+		rc := flate.NewReader(bytes.NewReader(data))
+		res, ok := rc.(flate.Resetter)
+		if !ok {
+			return rc, nil
+		}
+		d.rc, d.res = rc, res
+		return rc, nil
+	}
+	if err := d.res.Reset(bytes.NewReader(data), nil); err != nil {
+		return nil, err
+	}
+	return d.rc, nil
+}
+
+func (d *literalDecoder) close() {
+	if d.rc != nil {
+		_ = d.rc.Close()
+		d.rc, d.res = nil, nil
+	}
 }
 
 // applyOps 将 ops 应用到 oldPath，结果写入 dst。
@@ -265,7 +314,7 @@ func applyOps(ctx opContext, oldPath string, ops []DeltaOp, dst io.Writer) error
 				return fmt.Errorf("复制旧文件区段失败: %w", err)
 			}
 		case OpLiteral:
-			if err := copyLiteral(&DeltaOp{Kind: OpLiteral, Comp: op.Comp, Data: op.Data, Length: op.Length}, dst); err != nil {
+			if err := copyLiteral(ctx, op.Comp, op.Data, op.Length, dst); err != nil {
 				return fmt.Errorf("写入字面量失败: %w", err)
 			}
 		case OpCopyFrom:
@@ -277,7 +326,7 @@ func applyOps(ctx opContext, oldPath string, ops []DeltaOp, dst io.Writer) error
 				return fmt.Errorf("块池引用越界: %d（池大小 %d）", op.PoolIndex, len(ctx.pool))
 			}
 			blob := &ctx.pool[op.PoolIndex]
-			if err := copyLiteral(&DeltaOp{Kind: OpLiteral, Comp: blob.Comp, Data: blob.Data, Length: op.Length}, dst); err != nil {
+			if err := copyLiteral(ctx, blob.Comp, blob.Data, op.Length, dst); err != nil {
 				return fmt.Errorf("写入块池数据失败: %w", err)
 			}
 		default:
@@ -287,20 +336,38 @@ func applyOps(ctx opContext, oldPath string, ops []DeltaOp, dst io.Writer) error
 	return nil
 }
 
-func copyLiteral(op *DeltaOp, dst io.Writer) error {
-	r, err := literalReader(op)
+// copyLiteral 把长度为 length 的字面量写入 dst；comp 决定 data 如何解码。
+func copyLiteral(ctx opContext, comp CompMethod, data []byte, length uint64, dst io.Writer) error {
+	var (
+		r      io.Reader
+		closer io.Closer
+	)
+	switch comp {
+	case CompRaw:
+		r = bytes.NewReader(data)
+	case CompFlate:
+		if ctx.literal != nil {
+			fr, err := ctx.literal.reader(data)
+			if err != nil {
+				return err
+			}
+			r = fr
+		} else {
+			rc := flate.NewReader(bytes.NewReader(data))
+			r, closer = rc, rc
+		}
+	default:
+		return fmt.Errorf("非法压缩方式: %d", comp)
+	}
+	if closer != nil {
+		defer closer.Close()
+	}
+	n, err := io.Copy(dst, io.LimitReader(r, int64(length)+1))
 	if err != nil {
 		return err
 	}
-	n, err := io.Copy(dst, io.LimitReader(r, int64(op.Length)+1))
-	if closer, ok := r.(io.Closer); ok {
-		closer.Close()
-	}
-	if err != nil {
-		return err
-	}
-	if uint64(n) != op.Length {
-		return fmt.Errorf("长度不匹配: 期望 %d，实际 %d", op.Length, n)
+	if uint64(n) != length {
+		return fmt.Errorf("长度不匹配: 期望 %d，实际 %d", length, n)
 	}
 	return nil
 }
@@ -331,15 +398,4 @@ func copyFromFile(ctx opContext, op *DeltaOp, dst io.Writer) error {
 		return fmt.Errorf("跨文件复制 %s 失败: %w", op.SrcPath, err)
 	}
 	return nil
-}
-
-func literalReader(op *DeltaOp) (io.Reader, error) {
-	switch op.Comp {
-	case CompRaw:
-		return bytes.NewReader(op.Data), nil
-	case CompFlate:
-		return flate.NewReader(bytes.NewReader(op.Data)), nil
-	default:
-		return nil, fmt.Errorf("非法压缩方式: %d", op.Comp)
-	}
 }
