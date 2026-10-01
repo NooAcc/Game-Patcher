@@ -36,29 +36,36 @@ func TestRealASARDeltaRoundTrip(t *testing.T) {
 	}
 
 	start := time.Now()
-	res, err := buildDelta(oldPath, newPath)
+	pool := newBlobPool()
+	res, err := buildChunkFileEntry(oldPath, newPath, "app.asar", newCrossIndex(), pool)
 	if err != nil {
-		t.Fatalf("buildDelta 失败: %v", err)
+		t.Fatalf("buildChunkFileEntry 失败: %v", err)
 	}
 	buildTime := time.Since(start)
 
-	blob, err := (&Patch{Entries: []Entry{{
-		Path: "app.asar", Action: ActionUpdate,
-		OldHash: res.OldHash, NewHash: res.NewHash,
-		OldSize: res.OldSize, NewSize: res.NewSize, Ops: res.Ops,
-	}}}).Encode()
-	if err != nil {
+	rel := &Release{PatchVersion: 1, Payload: NewChunkPayload(
+		[]string{"old", "new"},
+		[]ChainStep{{SourceIndex: 1, Entries: []Entry{{
+			Path: "app.asar", Action: ActionUpdate,
+			OldHash: res.OldHash, NewHash: res.NewHash,
+			OldSize: res.OldSize, NewSize: res.NewSize, Ops: res.Ops,
+		}}}},
+		pool.blobs,
+	)}
+	var blob bytes.Buffer
+	if err := EncodeRelease(&blob, rel); err != nil {
 		t.Fatal(err)
 	}
 
-	outPath := filepath.Join(t.TempDir(), "app.asar")
+	outPath := filepath.Join(tempWorkDir(t), "app.asar")
 	out, err := os.Create(outPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := applyDelta(oldPath, res.Ops, out); err != nil {
+	ctx := opContext{gameDir: filepath.Dir(oldPath), pool: pool.blobs}
+	if err := applyOps(ctx, oldPath, res.Ops, out); err != nil {
 		out.Close()
-		t.Fatalf("applyDelta 失败: %v", err)
+		t.Fatalf("applyOps 失败: %v", err)
 	}
 	if err := out.Close(); err != nil {
 		t.Fatal(err)
@@ -72,11 +79,11 @@ func TestRealASARDeltaRoundTrip(t *testing.T) {
 		t.Fatal("重建文件哈希与新版不一致")
 	}
 
-	ratio := 100 * float64(len(blob)) / float64(res.NewSize)
+	ratio := 100 * float64(blob.Len()) / float64(res.NewSize)
 	t.Logf("ASAR 增量: ops=%d patch=%s (%.3f%% of %s) build=%v",
-		len(res.Ops), FormatSize(int64(len(blob))), ratio, FormatSize(int64(res.NewSize)), buildTime.Round(time.Millisecond))
-	if uint64(len(blob)) > res.NewSize/50 {
-		t.Fatalf("补丁体积异常: %d 字节（新文件 %d 字节）", len(blob), res.NewSize)
+		len(res.Ops), FormatSize(int64(blob.Len())), ratio, FormatSize(int64(res.NewSize)), buildTime.Round(time.Millisecond))
+	if uint64(blob.Len()) > res.NewSize/50 {
+		t.Fatalf("补丁体积异常: %d 字节（新文件 %d 字节）", blob.Len(), res.NewSize)
 	}
 }
 
@@ -86,7 +93,7 @@ func TestExecutableEndToEnd(t *testing.T) {
 		t.Skip("短模式跳过端到端 EXE 测试")
 	}
 
-	root := t.TempDir()
+	root := tempWorkDir(t)
 	upgraderExe := filepath.Join(root, "upgrader.exe")
 	build := exec.Command("go", "build", "-o", upgraderExe, "game-patcher/cmd/upgrader")
 	build.Dir = ".."
@@ -175,5 +182,104 @@ func assertFilesMatch(t *testing.T, root, wantDir string) {
 	})
 	if err != nil {
 		t.Fatalf("文件对比失败: %v", err)
+	}
+}
+
+// runUpdater 把升级工具复制到游戏目录并运行，返回其输出。
+func runUpdater(t *testing.T, exe, gameDir string, confirm bool) string {
+	t.Helper()
+	target := filepath.Join(gameDir, filepath.Base(exe))
+	data, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, data, 0755); err != nil {
+		t.Fatal(err)
+	}
+	run := exec.Command(target)
+	run.Dir = gameDir
+	if confirm {
+		run.Stdin = strings.NewReader("y\n")
+	} else {
+		run.Stdin = strings.NewReader("\n")
+	}
+	out, err := run.CombinedOutput()
+	if err != nil {
+		t.Fatalf("运行升级工具失败: %v\n%s", err, out)
+	}
+	return string(out)
+}
+
+// TestExecutableEndToEndChain 验证链式补丁：fix1(v1→v2) 与 fix2(v2→v3) 合成后，
+// v1 与 v2 都能一步升级到 v3，v3 会被识别为已是最新，且回滚可回到链起点。
+func TestExecutableEndToEndChain(t *testing.T) {
+	if testing.Short() {
+		t.Skip("短模式跳过端到端 EXE 测试")
+	}
+
+	root := tempWorkDir(t)
+	upgraderExe := filepath.Join(root, "upgrader.exe")
+	build := exec.Command("go", "build", "-o", upgraderExe, "game-patcher/cmd/upgrader")
+	build.Dir = ".."
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("构建 upgrader 失败: %v\n%s", err, out)
+	}
+
+	v1 := filepath.Join(root, "v1")
+	v2 := filepath.Join(root, "v2")
+	v3 := filepath.Join(root, "v3")
+	writeTestFile(t, v1, "data.bin", []byte("alpha"))
+	writeTestFile(t, v1, "gone.bin", []byte("only in v1"))
+	writeTestFile(t, v2, "data.bin", []byte("alpha beta"))
+	writeTestFile(t, v2, "mid.bin", []byte("added in v2"))
+	writeTestFile(t, v3, "data.bin", []byte("alpha beta gamma"))
+	writeTestFile(t, v3, "mid.bin", []byte("added in v2"))
+	writeTestFile(t, v3, "last.bin", []byte("only in v3"))
+
+	fix1 := filepath.Join(root, "fix1.exe")
+	if err := CreatePatch(upgraderExe, v1, v2, fix1, ""); err != nil {
+		t.Fatalf("生成 fix1 失败: %v", err)
+	}
+	fix2 := filepath.Join(root, "fix2.exe")
+	if err := CreatePatchChain(upgraderExe, v2, v3, fix2, "", []string{fix1}); err != nil {
+		t.Fatalf("生成 fix2 失败: %v", err)
+	}
+
+	// 场景 1：v1 直接升级到 v3，然后回滚回 v1。
+	gameA := filepath.Join(root, "gameA")
+	copyTree(t, v1, gameA)
+	out := runUpdater(t, fix2, gameA, true)
+	if !strings.Contains(out, "升级完成") {
+		t.Fatalf("v1 升级输出异常:\n%s", out)
+	}
+	assertFilesMatch(t, gameA, v3)
+
+	backupDir := filepath.Join(gameA, backupDirName)
+	manifest, err := LoadRestoreManifest(backupDir)
+	if err != nil {
+		t.Fatalf("加载恢复清单失败: %v", err)
+	}
+	if err := Restore(manifest, backupDir); err != nil {
+		t.Fatalf("回滚失败: %v", err)
+	}
+	assertFilesMatch(t, gameA, v1)
+
+	// 场景 2：v2 直接升级到 v3。
+	gameB := filepath.Join(root, "gameB")
+	copyTree(t, v2, gameB)
+	if out := runUpdater(t, fix2, gameB, true); !strings.Contains(out, "升级完成") {
+		t.Fatalf("v2 升级输出异常:\n%s", out)
+	}
+	assertFilesMatch(t, gameB, v3)
+
+	// 场景 3：v3 已是最新，应跳过且不产生备份目录。
+	gameC := filepath.Join(root, "gameC")
+	copyTree(t, v3, gameC)
+	outC := runUpdater(t, fix2, gameC, false)
+	if !strings.Contains(outC, "已经是最新版本") {
+		t.Fatalf("已是最新版本输出异常:\n%s", outC)
+	}
+	if _, err := os.Stat(filepath.Join(gameC, backupDirName)); !os.IsNotExist(err) {
+		t.Fatal("已是最新版本时不应创建备份目录")
 	}
 }

@@ -9,58 +9,87 @@ import (
 	"time"
 )
 
-func samplePatch() *Patch {
-	return &Patch{
-		Entries: []Entry{
-			{
-				Path: "dir/a.bin", Action: ActionUpdate,
-				OldHash: HashBytes([]byte("old")), NewHash: HashBytes([]byte("new")),
-				OldSize: 3, NewSize: 3,
-				Ops: []DeltaOp{
-					{Kind: OpCopy, OldOffset: 0, Length: 2},
-					{Kind: OpLiteral, Length: 3, Comp: CompRaw, Data: []byte("abc")},
+func sampleRelease() *Release {
+	pool := []Blob{{Hash: HashBytes([]byte("abc")), Comp: CompRaw, RawLen: 3, Data: []byte("abc")}}
+	return &Release{
+		PatchVersion: 1,
+		Payload: NewChunkPayload(
+			[]string{"v1", "v2"},
+			[]ChainStep{{
+				SourceIndex: 1,
+				Entries: []Entry{
+					{
+						Path: "dir/a.bin", Action: ActionUpdate,
+						OldHash: HashBytes([]byte("old")), NewHash: HashBytes([]byte("new")),
+						OldSize: 8, NewSize: 5,
+						Ops: []DeltaOp{
+							{Kind: OpCopy, OldOffset: 0, Length: 2},
+							{Kind: OpCopyFrom, SrcPath: "other.bin", OldOffset: 1, Length: 2},
+							{Kind: OpPoolRef, PoolIndex: 0, Length: 3},
+						},
+					},
+					{Path: "b.bin", Action: ActionDelete, OldHash: HashBytes([]byte("gone")), OldSize: 4},
 				},
-			},
-			{Path: "b.bin", Action: ActionDelete, OldHash: HashBytes([]byte("gone")), OldSize: 4},
-		},
+			}},
+			pool,
+		),
 	}
 }
 
-func TestPatchEncodeDecodeRoundTrip(t *testing.T) {
-	p := samplePatch()
-	blob, err := p.Encode()
+func encodeReleaseBytes(t *testing.T, rel *Release) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := EncodeRelease(&buf, rel); err != nil {
+		t.Fatalf("EncodeRelease 失败: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestReleaseEncodeDecodeRoundTrip(t *testing.T) {
+	rel := sampleRelease()
+	got, err := DecodeRelease(encodeReleaseBytes(t, rel))
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := DecodePatch(blob)
-	if err != nil {
-		t.Fatal(err)
+	if got.PatchVersion != rel.PatchVersion {
+		t.Fatalf("补丁版本号不一致: %d != %d", got.PatchVersion, rel.PatchVersion)
 	}
-	if len(got.Entries) != len(p.Entries) {
-		t.Fatalf("解码结果不一致: %+v", got)
+	gotPayload, src := got.Payload, rel.Payload
+	if gotPayload == nil {
+		t.Fatal("差异数据丢失")
 	}
-	for i := range p.Entries {
-		want, have := p.Entries[i], got.Entries[i]
-		if want.Path != have.Path || want.Action != have.Action || want.OldHash != have.OldHash || want.NewHash != have.NewHash {
-			t.Fatalf("条目 %d 不一致", i)
+	if len(gotPayload.Labels) != len(src.Labels) || len(gotPayload.Steps) != len(src.Steps) {
+		t.Fatalf("链结构不一致: %+v", gotPayload)
+	}
+	if len(gotPayload.Pool) != len(src.Pool) {
+		t.Fatalf("块池不一致: %d != %d", len(gotPayload.Pool), len(src.Pool))
+	}
+	for i := range src.Steps {
+		we, he := src.Steps[i].Entries, gotPayload.Steps[i].Entries
+		if gotPayload.Steps[i].SourceIndex != src.Steps[i].SourceIndex || len(we) != len(he) {
+			t.Fatalf("第 %d 段不一致", i+1)
 		}
-		if len(want.Ops) != len(have.Ops) {
-			t.Fatalf("条目 %d 操作数不一致", i)
-		}
-		for j := range want.Ops {
-			wo, ho := want.Ops[j], have.Ops[j]
-			if wo.Kind != ho.Kind || wo.OldOffset != ho.OldOffset || wo.Length != ho.Length || wo.Comp != ho.Comp || !bytes.Equal(wo.Data, ho.Data) {
-				t.Fatalf("条目 %d 操作 %d 不一致", i, j)
+		for j := range we {
+			a, b := we[j], he[j]
+			if a.Path != b.Path || a.Action != b.Action || a.OldHash != b.OldHash || a.NewHash != b.NewHash {
+				t.Fatalf("条目 %d 不一致", j)
+			}
+			if len(a.Ops) != len(b.Ops) {
+				t.Fatalf("条目 %d 操作数不一致", j)
+			}
+			for k := range a.Ops {
+				oa, ob := a.Ops[k], b.Ops[k]
+				if oa.Kind != ob.Kind || oa.OldOffset != ob.OldOffset || oa.Length != ob.Length ||
+					oa.Comp != ob.Comp || !bytes.Equal(oa.Data, ob.Data) {
+					t.Fatalf("条目 %d 操作 %d 不一致", j, k)
+				}
 			}
 		}
 	}
 }
 
-func TestDecodePatchRejectsTruncatedData(t *testing.T) {
-	blob, err := samplePatch().Encode()
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestDecodeReleaseRejectsTruncatedData(t *testing.T) {
+	blob := encodeReleaseBytes(t, sampleRelease())
 	for n := 0; n < len(blob); n++ {
 		func() {
 			defer func() {
@@ -68,42 +97,75 @@ func TestDecodePatchRejectsTruncatedData(t *testing.T) {
 					t.Fatalf("截断到 %d 字节时发生 panic: %v", n, r)
 				}
 			}()
-			if _, err := DecodePatch(blob[:n]); err == nil {
+			if _, err := DecodeRelease(blob[:n]); err == nil {
 				t.Fatalf("截断到 %d 字节应返回错误", n)
 			}
 		}()
 	}
 }
 
-func TestDecodePatchRejectsBadMagicAndVersion(t *testing.T) {
-	if _, err := DecodePatch([]byte("NOT-A-PATCH-AT-ALL")); err == nil {
+func TestDecodeReleaseRejectsBadMagicVersionAndKind(t *testing.T) {
+	if _, err := DecodeRelease([]byte("NOT-A-PATCH-AT-ALL")); err == nil {
 		t.Fatal("错误魔数应被拒绝")
 	}
-	blob, err := samplePatch().Encode()
-	if err != nil {
-		t.Fatal(err)
+	blob := encodeReleaseBytes(t, sampleRelease())
+
+	badVer := append([]byte(nil), blob...)
+	badVer[len(patchMagic)] = 99
+	if _, err := DecodeRelease(badVer); err == nil {
+		t.Fatal("错误格式版本应被拒绝")
 	}
-	bad := append([]byte(nil), blob...)
-	bad[len(patchMagic)] = 99
-	if _, err := DecodePatch(bad); err == nil {
-		t.Fatal("错误版本应被拒绝")
+
+	badKind := append([]byte(nil), blob...)
+	badKind[len(patchMagic)+1] = 99
+	if _, err := DecodeRelease(badKind); err == nil {
+		t.Fatal("不支持的差异后端应被拒绝")
 	}
 }
 
-func TestEncodeRejectsUnsafePath(t *testing.T) {
-	p := &Patch{Entries: []Entry{{Path: "../evil.txt", Action: ActionUpdate}}}
-	if _, err := p.Encode(); err == nil {
+func TestEncodeReleaseRejectsUnsafePath(t *testing.T) {
+	rel := &Release{PatchVersion: 1, Payload: NewChunkPayload(
+		[]string{"a", "b"},
+		[]ChainStep{{SourceIndex: 1, Entries: []Entry{{Path: "../evil.txt", Action: ActionUpdate}}}},
+		nil,
+	)}
+	var buf bytes.Buffer
+	if err := EncodeRelease(&buf, rel); err == nil {
 		t.Fatal("路径穿越应被拒绝")
 	}
 }
 
-func TestDecodePatchRejectsHugeCounts(t *testing.T) {
+func TestDecodeReleaseRejectsHugeCounts(t *testing.T) {
 	var b bytes.Buffer
 	b.WriteString(patchMagic)
-	b.WriteByte(patchVersion)
-	putU32(&b, 0xFFFFFFFF)
-	if _, err := DecodePatch(b.Bytes()); err == nil {
-		t.Fatal("超大条目数应被拒绝")
+	b.WriteByte(formatVersion)
+	b.WriteByte(byte(PayloadChunk))
+	var v [4]byte
+	b.Write(v[:])                           // patchVersion = 0
+	b.Write([]byte{0xFF, 0xFF, 0xFF, 0xFF}) // labelCount 超大
+	if _, err := DecodeRelease(b.Bytes()); err == nil {
+		t.Fatal("超大版本标签数应被拒绝")
+	}
+}
+
+func TestChainSelfCheckRejectsBrokenChain(t *testing.T) {
+	entry := Entry{Path: "x", Action: ActionUpdate, NewSize: 1, Ops: []DeltaOp{{Kind: OpPoolRef, PoolIndex: 0, Length: 1}}}
+	pool := []Blob{{Hash: HashBytes([]byte("x")), Comp: CompRaw, RawLen: 1, Data: []byte("x")}}
+	cases := []struct {
+		name  string
+		chain *ChunkPayload
+	}{
+		{"空链", NewChunkPayload([]string{"a"}, nil, nil)},
+		{"标签数量不符", NewChunkPayload([]string{"a"}, []ChainStep{{SourceIndex: 1, Entries: []Entry{entry}}}, pool)},
+		{"源序号跳跃", NewChunkPayload([]string{"a", "b"}, []ChainStep{{SourceIndex: 2, Entries: []Entry{entry}}}, pool)},
+		{"空段", NewChunkPayload([]string{"a", "b"}, []ChainStep{{SourceIndex: 1}}, nil)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if err := c.chain.SelfCheck(); err == nil {
+				t.Fatal("非法链应被拒绝")
+			}
+		})
 	}
 }
 
@@ -123,7 +185,7 @@ func TestValidateRelPath(t *testing.T) {
 }
 
 func TestSafeJoin(t *testing.T) {
-	root := t.TempDir()
+	root := tempWorkDir(t)
 	got, err := SafeJoin(root, "dir/a.bin")
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +200,7 @@ func TestSafeJoin(t *testing.T) {
 }
 
 func TestCleanupEmptyDirsStaysInsideStop(t *testing.T) {
-	root := t.TempDir()
+	root := tempWorkDir(t)
 	deep := filepath.Join(root, "a", "b", "c")
 	if err := os.MkdirAll(deep, 0755); err != nil {
 		t.Fatal(err)
@@ -151,7 +213,7 @@ func TestCleanupEmptyDirsStaysInsideStop(t *testing.T) {
 		t.Fatalf("stopAt 目录不应被删除: %v", err)
 	}
 
-	outside := filepath.Join(t.TempDir(), "x")
+	outside := filepath.Join(tempWorkDir(t), "x")
 	if err := os.MkdirAll(outside, 0755); err != nil {
 		t.Fatal(err)
 	}

@@ -1,26 +1,27 @@
 package patcher
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 )
 
-// 补丁数据格式版本 3（二进制增量修补，仅支持目录树补丁）。
+// GPBIN4 是链式补丁制品格式。信封布局：
 //
-//	"GPBIN3"                6B  补丁块魔数
-//	version                 uint8
-//	entryCount              uint32
-//	Entry[entryCount]
+//	"GPBIN4"       6B   魔数
+//	formatVersion  u8   (= 4)
+//	payloadKind    u8   差异后端类型
+//	patchVersion   u32  自动递增的补丁版本号
+//	payload        ...  由 payloadKind 决定
 //
 // 可执行文件尾部布局：
 //
-//	[base exe][patch blob][patchLen uint64][GPBIN3END!][[restorer][restorerLen uint64][GPBIN3RST!]]
+//	[base exe][release blob][blobLen u64]["GPBIN4END!"][[restorer][restorerLen u64]["GPBIN4RST!"]]
 const (
-	patchMagic    = "GPBIN3"
-	patchEndMagic = "GPBIN3END!"
-	restorerMagic = "GPBIN3RST!"
-	patchVersion  = 3
+	patchMagic    = "GPBIN4"
+	patchEndMagic = "GPBIN4END!"
+	restorerMagic = "GPBIN4RST!"
+	formatVersion = 4
 )
 
 // Action 描述一个条目要执行的变更。
@@ -49,10 +50,14 @@ func (a Action) String() string {
 type OpKind uint8
 
 const (
-	// OpCopy 从旧文件复制一段数据。
+	// OpCopy 从本文件的旧版本复制一段数据。
 	OpCopy OpKind = 1
 	// OpLiteral 写入字面量数据。
 	OpLiteral OpKind = 2
+	// OpCopyFrom 从同一版本树中的另一个文件复制一段数据（chunk 后端使用）。
+	OpCopyFrom OpKind = 3
+	// OpPoolRef 引用共享字面量池中的一段数据（chunk 后端使用）。
+	OpPoolRef OpKind = 4
 )
 
 // CompMethod 描述字面量压缩方式。
@@ -66,8 +71,10 @@ const (
 // DeltaOp 是构成新文件的最小操作单元。
 type DeltaOp struct {
 	Kind      OpKind
-	OldOffset uint64 // OpCopy: 旧文件偏移
-	Length    uint64 // OpCopy: 复制长度；OpLiteral: 解压后的长度
+	OldOffset uint64 // OpCopy / OpCopyFrom: 源偏移
+	Length    uint64 // OpCopy / OpCopyFrom: 复制长度；OpLiteral / OpPoolRef: 解压后的长度
+	SrcPath   string // OpCopyFrom: 源文件相对路径
+	PoolIndex uint32 // OpPoolRef: 共享字面量池下标
 	Comp      CompMethod
 	Data      []byte // OpLiteral 的载荷（可能已压缩）
 }
@@ -83,78 +90,25 @@ type Entry struct {
 	Ops     []DeltaOp
 }
 
-// Patch 是一个完整的补丁数据集。
-type Patch struct {
-	Entries []Entry
+// EncodeRelease 将一份补丁制品写入 w。
+func EncodeRelease(w io.Writer, rel *Release) error {
+	if rel == nil || rel.Payload == nil {
+		return fmt.Errorf("补丁内容为空")
+	}
+	e := &encWriter{w: w}
+	e.raw([]byte(patchMagic))
+	e.u8(formatVersion)
+	e.u8(byte(rel.Payload.Kind()))
+	e.u32(rel.PatchVersion)
+	if e.err != nil {
+		return e.err
+	}
+	return rel.Payload.Encode(w)
 }
 
-// Encode 将补丁序列化为字节流。
-func (p *Patch) Encode() ([]byte, error) {
-	if uint64(len(p.Entries)) > uint64(^uint32(0)) {
-		return nil, fmt.Errorf("条目数量过多")
-	}
-
-	var buf bytes.Buffer
-	buf.WriteString(patchMagic)
-	buf.WriteByte(patchVersion)
-	putU32(&buf, uint32(len(p.Entries)))
-
-	for i := range p.Entries {
-		e := &p.Entries[i]
-		if err := validateRelPath(e.Path); err != nil {
-			return nil, fmt.Errorf("条目 %d 路径非法: %w", i, err)
-		}
-		if len(e.Path) > int(^uint32(0)) {
-			return nil, fmt.Errorf("条目 %d 路径过长", i)
-		}
-		if e.Action < ActionAdd || e.Action > ActionDelete {
-			return nil, fmt.Errorf("条目 %d 行为非法: %d", i, e.Action)
-		}
-		putU32(&buf, uint32(len(e.Path)))
-		buf.WriteString(e.Path)
-		buf.WriteByte(byte(e.Action))
-		buf.Write(e.OldHash[:])
-		buf.Write(e.NewHash[:])
-		putU64(&buf, e.OldSize)
-		putU64(&buf, e.NewSize)
-
-		if uint64(len(e.Ops)) > uint64(^uint32(0)) {
-			return nil, fmt.Errorf("条目 %s 操作过多", e.Path)
-		}
-		putU32(&buf, uint32(len(e.Ops)))
-		for j := range e.Ops {
-			if err := encodeOp(&buf, &e.Ops[j]); err != nil {
-				return nil, fmt.Errorf("条目 %s 操作 %d: %w", e.Path, j, err)
-			}
-		}
-	}
-	return buf.Bytes(), nil
-}
-
-func encodeOp(buf *bytes.Buffer, op *DeltaOp) error {
-	switch op.Kind {
-	case OpCopy:
-		buf.WriteByte(byte(OpCopy))
-		putU64(buf, op.OldOffset)
-		putU64(buf, op.Length)
-		return nil
-	case OpLiteral:
-		if op.Comp != CompRaw && op.Comp != CompFlate {
-			return fmt.Errorf("非法压缩方式: %d", op.Comp)
-		}
-		buf.WriteByte(byte(OpLiteral))
-		buf.WriteByte(byte(op.Comp))
-		putU64(buf, op.Length)
-		putU64(buf, uint64(len(op.Data)))
-		buf.Write(op.Data)
-		return nil
-	default:
-		return fmt.Errorf("非法操作类型: %d", op.Kind)
-	}
-}
-
-// DecodePatch 解析补丁字节流。所有长度字段都经过边界校验，损坏数据只会返回错误。
-func DecodePatch(data []byte) (*Patch, error) {
+// DecodeRelease 解析补丁制品字节流。所有长度字段都经过边界校验，
+// 损坏数据只会返回错误，不会 panic。
+func DecodeRelease(data []byte) (*Release, error) {
 	d := &decoder{data: data}
 	magic, err := d.raw(len(patchMagic))
 	if err != nil {
@@ -163,92 +117,143 @@ func DecodePatch(data []byte) (*Patch, error) {
 	if string(magic) != patchMagic {
 		return nil, fmt.Errorf("补丁魔数不匹配")
 	}
-	version, err := d.u8()
+	ver, err := d.u8()
 	if err != nil {
 		return nil, err
 	}
-	if version != patchVersion {
-		return nil, fmt.Errorf("不支持的补丁版本: %d", version)
+	if ver != formatVersion {
+		return nil, fmt.Errorf("不支持的补丁格式版本: %d", ver)
 	}
-	count, err := d.u32()
+	kind, err := d.u8()
 	if err != nil {
 		return nil, err
 	}
-	// 每个条目至少包含 pathLen(4)+action(1)+oldHash(32)+newHash(32)+oldSize(8)+newSize(8)+opCount(4)。
-	if uint64(count) > uint64(d.remaining()/minEntryEncodedSize)+1 {
-		return nil, fmt.Errorf("条目数量异常: %d", count)
+	patchVersion, err := d.u32()
+	if err != nil {
+		return nil, fmt.Errorf("补丁版本号: %w", err)
 	}
 
-	p := &Patch{Entries: make([]Entry, 0, count)}
-	for i := uint32(0); i < count; i++ {
-		pathLen, err := d.u32()
-		if err != nil {
-			return nil, fmt.Errorf("条目 %d: %w", i, err)
-		}
-		pathBytes, err := d.raw(int(pathLen))
-		if err != nil {
-			return nil, fmt.Errorf("条目 %d 路径越界: %w", i, err)
-		}
-		path := string(pathBytes)
-		if err := validateRelPath(path); err != nil {
-			return nil, fmt.Errorf("条目 %d 路径非法: %w", i, err)
-		}
-		action, err := d.u8()
-		if err != nil {
-			return nil, fmt.Errorf("条目 %d: %w", i, err)
-		}
-		if Action(action) < ActionAdd || Action(action) > ActionDelete {
-			return nil, fmt.Errorf("条目 %d 行为非法: %d", i, action)
-		}
-		oldHash, err := d.hash()
-		if err != nil {
-			return nil, fmt.Errorf("条目 %d: %w", i, err)
-		}
-		newHash, err := d.hash()
-		if err != nil {
-			return nil, fmt.Errorf("条目 %d: %w", i, err)
-		}
-		oldSize, err := d.u64()
-		if err != nil {
-			return nil, fmt.Errorf("条目 %d: %w", i, err)
-		}
-		newSize, err := d.u64()
-		if err != nil {
-			return nil, fmt.Errorf("条目 %d: %w", i, err)
-		}
-		opCount, err := d.u32()
-		if err != nil {
-			return nil, fmt.Errorf("条目 %d: %w", i, err)
-		}
-		// 每个操作至少 1 字节。
-		if uint64(opCount) > uint64(d.remaining())+1 {
-			return nil, fmt.Errorf("条目 %d 操作数量异常: %d", i, opCount)
-		}
-		e := Entry{
-			Path:    path,
-			Action:  Action(action),
-			OldHash: oldHash,
-			NewHash: newHash,
-			OldSize: oldSize,
-			NewSize: newSize,
-			Ops:     make([]DeltaOp, 0, opCount),
-		}
-		for j := uint32(0); j < opCount; j++ {
-			op, err := decodeOp(d)
-			if err != nil {
-				return nil, fmt.Errorf("条目 %s 操作 %d: %w", path, j, err)
-			}
-			e.Ops = append(e.Ops, op)
-		}
-		p.Entries = append(p.Entries, e)
+	var payload *ChunkPayload
+	switch PayloadKind(kind) {
+	case PayloadChunk:
+		payload, err = decodeChunkPayload(d)
+	case removedPayloadChain:
+		return nil, fmt.Errorf("该补丁使用已移除的 chain 后端；请用当前版本的 CLI 重新生成补丁")
+	default:
+		return nil, fmt.Errorf("不支持的差异后端类型: %d", kind)
+	}
+	if err != nil {
+		return nil, err
 	}
 	if d.remaining() != 0 {
 		return nil, fmt.Errorf("补丁数据尾部存在 %d 字节多余内容", d.remaining())
 	}
-	return p, nil
+	return &Release{PatchVersion: patchVersion, Payload: payload}, nil
 }
 
-const minEntryEncodedSize = 4 + 1 + 32 + 32 + 8 + 8 + 4
+func encodeEntry(e *encWriter, en *Entry) {
+	if en.Action < ActionAdd || en.Action > ActionDelete {
+		e.fail(fmt.Errorf("条目 %s 行为非法: %d", en.Path, en.Action))
+		return
+	}
+	if err := validateRelPath(en.Path); err != nil {
+		e.fail(fmt.Errorf("条目路径非法: %w", err))
+		return
+	}
+	e.str(en.Path)
+	e.u8(byte(en.Action))
+	e.raw(en.OldHash[:])
+	e.raw(en.NewHash[:])
+	e.u64(en.OldSize)
+	e.u64(en.NewSize)
+	e.u32(uint32(len(en.Ops)))
+	for j := range en.Ops {
+		encodeOp(e, &en.Ops[j])
+	}
+}
+
+func encodeOp(e *encWriter, op *DeltaOp) {
+	switch op.Kind {
+	case OpCopy:
+		e.u8(byte(OpCopy))
+		e.u64(op.OldOffset)
+		e.u64(op.Length)
+	case OpLiteral:
+		if op.Comp != CompRaw && op.Comp != CompFlate {
+			e.fail(fmt.Errorf("非法压缩方式: %d", op.Comp))
+			return
+		}
+		e.u8(byte(OpLiteral))
+		e.u8(byte(op.Comp))
+		e.u64(op.Length)
+		e.u64(uint64(len(op.Data)))
+		e.raw(op.Data)
+	case OpCopyFrom:
+		if err := validateRelPath(op.SrcPath); err != nil {
+			e.fail(fmt.Errorf("跨文件复制的源路径非法: %w", err))
+			return
+		}
+		e.u8(byte(OpCopyFrom))
+		e.str(op.SrcPath)
+		e.u64(op.OldOffset)
+		e.u64(op.Length)
+	case OpPoolRef:
+		e.u8(byte(OpPoolRef))
+		e.u32(op.PoolIndex)
+		e.u64(op.Length)
+	default:
+		e.fail(fmt.Errorf("非法操作类型: %d", op.Kind))
+	}
+}
+
+func decodeEntry(d *decoder) (Entry, error) {
+	var en Entry
+	path, err := d.str()
+	if err != nil {
+		return en, err
+	}
+	if err := validateRelPath(path); err != nil {
+		return en, fmt.Errorf("路径非法: %w", err)
+	}
+	en.Path = path
+	action, err := d.u8()
+	if err != nil {
+		return en, err
+	}
+	if Action(action) < ActionAdd || Action(action) > ActionDelete {
+		return en, fmt.Errorf("行为非法: %d", action)
+	}
+	en.Action = Action(action)
+	if en.OldHash, err = d.hash(); err != nil {
+		return en, err
+	}
+	if en.NewHash, err = d.hash(); err != nil {
+		return en, err
+	}
+	if en.OldSize, err = d.u64(); err != nil {
+		return en, err
+	}
+	if en.NewSize, err = d.u64(); err != nil {
+		return en, err
+	}
+	opCount, err := d.u32()
+	if err != nil {
+		return en, err
+	}
+	// 每个操作至少 1 字节。
+	if uint64(opCount) > uint64(d.remaining())+1 {
+		return en, fmt.Errorf("操作数量异常: %d", opCount)
+	}
+	en.Ops = make([]DeltaOp, 0, opCount)
+	for j := uint32(0); j < opCount; j++ {
+		op, err := decodeOp(d)
+		if err != nil {
+			return en, fmt.Errorf("操作 %d: %w", j, err)
+		}
+		en.Ops = append(en.Ops, op)
+	}
+	return en, nil
+}
 
 func decodeOp(d *decoder) (DeltaOp, error) {
 	kind, err := d.u8()
@@ -293,10 +298,88 @@ func decodeOp(d *decoder) (DeltaOp, error) {
 			return DeltaOp{}, err
 		}
 		return DeltaOp{Kind: OpLiteral, Length: rawLen, Comp: CompMethod(comp), Data: payload}, nil
+	case OpCopyFrom:
+		src, err := d.str()
+		if err != nil {
+			return DeltaOp{}, err
+		}
+		if err := validateRelPath(src); err != nil {
+			return DeltaOp{}, fmt.Errorf("跨文件复制的源路径非法: %w", err)
+		}
+		off, err := d.u64()
+		if err != nil {
+			return DeltaOp{}, err
+		}
+		length, err := d.u64()
+		if err != nil {
+			return DeltaOp{}, err
+		}
+		if length == 0 {
+			return DeltaOp{}, fmt.Errorf("跨文件复制长度为 0")
+		}
+		return DeltaOp{Kind: OpCopyFrom, SrcPath: src, OldOffset: off, Length: length}, nil
+	case OpPoolRef:
+		idx, err := d.u32()
+		if err != nil {
+			return DeltaOp{}, err
+		}
+		length, err := d.u64()
+		if err != nil {
+			return DeltaOp{}, err
+		}
+		if length == 0 {
+			return DeltaOp{}, fmt.Errorf("块池引用长度为 0")
+		}
+		return DeltaOp{Kind: OpPoolRef, PoolIndex: idx, Length: length}, nil
 	default:
 		return DeltaOp{}, fmt.Errorf("非法操作类型: %d", kind)
 	}
 }
+
+// ── 写入辅助 ────────────────────────────────────────────────
+
+type encWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (e *encWriter) fail(err error) {
+	if e.err == nil {
+		e.err = err
+	}
+}
+
+func (e *encWriter) raw(b []byte) {
+	if e.err != nil {
+		return
+	}
+	_, e.err = e.w.Write(b)
+}
+
+func (e *encWriter) u8(v byte) { e.raw([]byte{v}) }
+
+func (e *encWriter) u32(v uint32) {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], v)
+	e.raw(b[:])
+}
+
+func (e *encWriter) u64(v uint64) {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], v)
+	e.raw(b[:])
+}
+
+func (e *encWriter) str(s string) {
+	if len(s) > int(^uint32(0)) {
+		e.fail(fmt.Errorf("字符串过长: %d", len(s)))
+		return
+	}
+	e.u32(uint32(len(s)))
+	e.raw([]byte(s))
+}
+
+// ── 读取辅助 ────────────────────────────────────────────────
 
 type decoder struct {
 	data []byte
@@ -348,14 +431,17 @@ func (d *decoder) hash() ([32]byte, error) {
 	return h, nil
 }
 
-func putU32(buf *bytes.Buffer, v uint32) {
-	var b [4]byte
-	binary.LittleEndian.PutUint32(b[:], v)
-	buf.Write(b[:])
-}
-
-func putU64(buf *bytes.Buffer, v uint64) {
-	var b [8]byte
-	binary.LittleEndian.PutUint64(b[:], v)
-	buf.Write(b[:])
+func (d *decoder) str() (string, error) {
+	n, err := d.u32()
+	if err != nil {
+		return "", err
+	}
+	if uint64(n) > uint64(d.remaining()) {
+		return "", fmt.Errorf("字符串长度越界: %d（剩余 %d）", n, d.remaining())
+	}
+	b, err := d.raw(int(n))
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
