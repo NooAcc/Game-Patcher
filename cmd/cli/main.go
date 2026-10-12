@@ -12,6 +12,8 @@ import (
 
 	"golang.org/x/term"
 
+	"game-patcher/adapter"
+	_ "game-patcher/adapter/all"
 	"game-patcher/patcher"
 )
 
@@ -101,6 +103,8 @@ func main() {
 	output := flag.String("out", "", "输出升级工具路径（默认: 当前目录/game-updater.exe）")
 	upgraderFlag := flag.String("upgrader", "", "升级工具基础程序路径（默认: 自动查找）")
 	restorerFlag := flag.String("restorer", "", "恢复工具二进制路径（默认: 自动查找）")
+	godotKey := flag.String("godot-key", "", "Godot PCK AES-256 key（64 位 hex，或包含 key 的文件路径）")
+	adapterFlag := flag.String("adapter", "none", "适配器选择：none 或适配器名称")
 	shellMode := flag.Bool("shell", false, "进入交互模式（双击或无参数启动时默认进入）")
 	var prevPatches stringList
 	flag.Var(&prevPatches, "prev", "附加的旧版本补丁（可重复或用逗号分隔），新补丁版本号自动 +1")
@@ -143,13 +147,18 @@ func main() {
 			patcher.Fatal("❌ 找不到升级工具基础程序 (upgrader)，请使用 -upgrader 指定路径")
 		}
 		restorerPath := findBinary(selfPath, *restorerFlag, restorerCandidates)
+		adapterOpts, err := buildAdapterOptions(*adapterFlag, *godotKey)
+		if err != nil {
+			patcher.Fatal("❌ %v", err)
+		}
 		err = patcher.CreatePatchWithOptions(patcher.CreatePatchOptions{
-			BaseExe:   upgraderPath,
-			OldDir:    absOld,
-			NewDir:    absNew,
-			Output:    absOut,
-			Restorer:  restorerPath,
-			PrevPaths: prevPaths,
+			BaseExe:        upgraderPath,
+			OldDir:         absOld,
+			NewDir:         absNew,
+			Output:         absOut,
+			Restorer:       restorerPath,
+			PrevPaths:      prevPaths,
+			AdapterOptions: adapterOpts,
 		})
 		if err != nil {
 			handleCreateError(err, false)
@@ -215,8 +224,22 @@ func findBinary(selfPath, userSpecified string, candidates []string) string {
 }
 
 func runInteractive(selfPath string) error {
-	r := bufio.NewReader(os.Stdin)
+	if term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd())) {
+		cfg, err := runInteractiveWizard(selfPath)
+		if err != nil {
+			return err
+		}
+		return runInteractiveWithConfig(selfPath, cfg)
+	}
 
+	cfg, err := collectInteractiveConfigPlain(bufio.NewReader(os.Stdin), selfPath)
+	if err != nil {
+		return err
+	}
+	return runInteractiveWithConfig(selfPath, cfg)
+}
+
+func collectInteractiveConfigPlain(r *bufio.Reader, selfPath string) (interactiveConfig, error) {
 	fmt.Println("╔══════════════════════════════════════╗")
 	fmt.Println("║   🎮 二进制升级包制作工具 (交互)     ║")
 	fmt.Println("╚══════════════════════════════════════╝")
@@ -224,30 +247,62 @@ func runInteractive(selfPath string) error {
 
 	oldPath, err := promptPath(r, "旧版本文件夹路径")
 	if err != nil {
-		return err
+		return interactiveConfig{}, err
 	}
 	newPath, err := promptPath(r, "新版本文件夹路径")
 	if err != nil {
-		return err
+		return interactiveConfig{}, err
 	}
 
 	oldInfo, err := os.Stat(oldPath)
 	if err != nil {
-		return fmt.Errorf("旧版本路径无效: %w", err)
+		return interactiveConfig{}, fmt.Errorf("旧版本路径无效: %w", err)
 	}
 	newInfo, err := os.Stat(newPath)
 	if err != nil {
-		return fmt.Errorf("新版本路径无效: %w", err)
+		return interactiveConfig{}, fmt.Errorf("新版本路径无效: %w", err)
 	}
 	if !oldInfo.IsDir() || !newInfo.IsDir() {
-		return errors.New("仅支持目录模式：旧版本与新版本必须都是文件夹")
+		return interactiveConfig{}, errors.New("仅支持目录模式：旧版本与新版本必须都是文件夹")
 	}
 
 	prevPaths, err := promptPrevPatches(r)
 	if err != nil {
-		return err
+		return interactiveConfig{}, err
+	}
+	selectedAdapter, err := promptAdapter(r)
+	if err != nil {
+		return interactiveConfig{}, err
+	}
+	godotKey := ""
+	if selectedAdapter == "godot" {
+		godotKey, err = promptGodotKey(r)
+		if err != nil {
+			return interactiveConfig{}, err
+		}
 	}
 	output := promptOutput(r, selfPath)
+	return interactiveConfig{
+		OldPath:   oldPath,
+		NewPath:   newPath,
+		PrevPaths: prevPaths,
+		Adapter:   selectedAdapter,
+		GodotKey:  godotKey,
+		Output:    output,
+	}, nil
+}
+
+func runInteractiveWithConfig(selfPath string, cfg interactiveConfig) error {
+	if cfg.Adapter == "" {
+		cfg.Adapter = adapter.SelectedNone
+	}
+	if cfg.Output == "" {
+		cfg.Output = filepath.Join(filepath.Dir(selfPath), "game-updater.exe")
+	}
+	adapterOpts, err := buildAdapterOptions(cfg.Adapter, cfg.GodotKey)
+	if err != nil {
+		return err
+	}
 
 	upgraderPath := findBinary(selfPath, "", upgraderCandidates)
 	if upgraderPath == "" {
@@ -256,12 +311,13 @@ func runInteractive(selfPath string) error {
 	restorerPath := findBinary(selfPath, "", restorerCandidates)
 
 	fmt.Println()
-	fmt.Printf("  旧版本: %s\n", oldPath)
-	fmt.Printf("  新版本: %s\n", newPath)
-	fmt.Printf("  输  出: %s\n", output)
-	if len(prevPaths) > 0 {
-		fmt.Printf("  附加旧补丁: %d 份\n", len(prevPaths))
-		for _, p := range prevPaths {
+	fmt.Printf("  旧版本: %s\n", cfg.OldPath)
+	fmt.Printf("  新版本: %s\n", cfg.NewPath)
+	fmt.Printf("  输  出: %s\n", cfg.Output)
+	fmt.Printf("  适配器: %s\n", adapterSelectionDisplay(cfg.Adapter))
+	if len(cfg.PrevPaths) > 0 {
+		fmt.Printf("  附加旧补丁: %d 份\n", len(cfg.PrevPaths))
+		for _, p := range cfg.PrevPaths {
 			fmt.Printf("      • %s\n", filepath.Base(p))
 		}
 	} else {
@@ -276,16 +332,16 @@ func runInteractive(selfPath string) error {
 	fmt.Println()
 
 	return patcher.CreatePatchWithOptions(patcher.CreatePatchOptions{
-		BaseExe:   upgraderPath,
-		OldDir:    oldPath,
-		NewDir:    newPath,
-		Output:    output,
-		Restorer:  restorerPath,
-		PrevPaths: prevPaths,
+		BaseExe:        upgraderPath,
+		OldDir:         cfg.OldPath,
+		NewDir:         cfg.NewPath,
+		Output:         cfg.Output,
+		Restorer:       restorerPath,
+		PrevPaths:      cfg.PrevPaths,
+		AdapterOptions: adapterOpts,
 	})
 }
 
-// promptPrevPatches 循环询问要附加的旧补丁，直到输入空行为止。
 func promptPrevPatches(r *bufio.Reader) ([]string, error) {
 	var out []string
 	for {
@@ -365,6 +421,7 @@ func printUsage() {
 	fmt.Println("参数模式:")
 	fmt.Printf("  %s -old <旧版本目录> -new <新版本目录> [-out <输出>]\n", exe)
 	fmt.Printf("        [-prev <旧补丁>]... [-upgrader <升级工具>] [-restorer <恢复工具>]\n")
+	fmt.Printf("        [-adapter <none|名称>] [-godot-key <64位hex或key文件>]\n")
 	fmt.Println()
 	fmt.Println("交互模式:")
 	fmt.Printf("  %s -shell\n", exe)
@@ -377,6 +434,9 @@ func printUsage() {
 	fmt.Println("  扫描后会列出所有变更文件，使用 ↑/↓ 移动、空格 选择/取消、回车 生成补丁。")
 	fmt.Println("  非交互终端（管道/CI）会自动包含全部变更文件。")
 	fmt.Println("  补丁使用共享块池，并复用被删除文件的块；重命名/移动大文件时体积显著更小。")
+	fmt.Println("  -adapter 选择引擎适配器：none 禁用（默认），或指定具体适配器名称。")
+	fmt.Println("  -godot-key 用于 Godot 加密 PCK：未变化文件直接复用旧 PCK blob，大幅减小补丁。")
+	fmt.Println("  非 Godot、key 缺失或 PCK 自定义保护时会自动回退普通字节差分。")
 	fmt.Printf("平台: %s/%s\n", runtime.GOOS, runtime.GOARCH)
 }
 
@@ -395,4 +455,68 @@ func handleCreateError(err error, keepOpen bool) {
 		os.Exit(1)
 	}
 	patcher.Fatal("❌ 创建失败: %v", err)
+}
+
+// buildAdapterOptions 解析 CLI 传入的适配器配置。Godot key 支持直接 hex 或文件路径。
+func buildAdapterOptions(adapterName, godotKey string) (adapter.Options, error) {
+	opts := adapter.Options{Values: map[string]string{}}
+	adapterName = strings.TrimSpace(adapterName)
+	if adapterName == "" {
+		adapterName = adapter.SelectedNone
+	}
+	if !validAdapterSelection(adapterName) {
+		return opts, fmt.Errorf("未知适配器 %q；可用值: none 或已注册适配器名称", adapterName)
+	}
+	opts.Values[adapter.OptionSelected] = adapterName
+	godotKey = cleanPath(godotKey)
+	if godotKey == "" {
+		return opts, nil
+	}
+	if info, err := os.Stat(godotKey); err == nil && !info.IsDir() {
+		data, err := os.ReadFile(godotKey)
+		if err != nil {
+			return opts, fmt.Errorf("读取 Godot key 文件失败: %w", err)
+		}
+		godotKey = strings.TrimSpace(string(data))
+	}
+	key, err := parseGodotHexKey(godotKey)
+	if err != nil {
+		return opts, err
+	}
+	opts.Values["godot.key"] = key
+	return opts, nil
+}
+
+func parseGodotHexKey(s string) (string, error) {
+	s = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "0x"))
+	if len(s) != 64 {
+		return "", fmt.Errorf("Godot AES key 必须是 64 位 hex 或包含 64 位 hex 的文件")
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return "", fmt.Errorf("Godot AES key 含非法字符")
+		}
+	}
+	return strings.ToLower(s), nil
+}
+
+func validAdapterSelection(name string) bool {
+	if name == adapter.SelectedNone {
+		return true
+	}
+	for _, a := range adapter.DefaultRegistry.Adapters() {
+		if a.Name() == name {
+			return true
+		}
+	}
+	return false
+}
+
+func promptGodotKey(r *bufio.Reader) (string, error) {
+	fmt.Print("🔑 Godot PCK AES key（留空跳过，可输入 64 位 hex 或 key 文件路径）: ")
+	line, err := r.ReadString('\n')
+	if err != nil && line == "" {
+		return "", nil
+	}
+	return cleanPath(line), nil
 }

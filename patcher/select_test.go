@@ -1,12 +1,11 @@
 package patcher
 
 import (
-	"bufio"
-	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func testJobs(n int) []treeJob {
@@ -101,54 +100,46 @@ func TestSelectionRender(t *testing.T) {
 	}
 }
 
-func TestReadSelectorKey(t *testing.T) {
-	r := bufio.NewReader(strings.NewReader("\x1b[A\x1b[B \rq"))
-	want := []keyKind{keyUp, keyDown, keySpace, keyEnter, keyCancel}
-	for i, w := range want {
-		got, err := readSelectorKey(r)
-		if err != nil {
-			t.Fatalf("第 %d 个按键读取失败: %v", i, err)
-		}
-		if got != w {
-			t.Fatalf("第 %d 个按键 = %d，期望 %d", i, got, w)
-		}
+func TestSelectionProgramModelConfirmAndCancel(t *testing.T) {
+	m := newSelectionProgramModel(testJobs(3), 80, 20)
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeySpace})
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeyEnter})
+	if len(m.chosen) != 2 || m.chosen[0].path != "dir/file01.bin" {
+		t.Fatalf("确认后 chosen=%+v", m.chosen)
+	}
+
+	cancelled := newSelectionProgramModel(testJobs(3), 80, 20)
+	cancelled, _ = cancelled.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	if !cancelled.cancelled {
+		t.Fatal("q 应取消选择")
 	}
 }
 
-func TestRunSelectorConfirmAndCancel(t *testing.T) {
-	jobs := testJobs(3)
-	chosen, err := runSelector(jobs, strings.NewReader(" \r"), io.Discard, 80, 10)
-	if err != nil {
-		t.Fatalf("确认流程失败: %v", err)
+func TestSelectionProgramModelRequiresAtLeastOne(t *testing.T) {
+	m := newSelectionProgramModel(testJobs(3), 80, 20)
+	m.core.toggleAll()
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.chosen != nil {
+		t.Fatalf("零选择不应确认: %+v", m.chosen)
 	}
-	if len(chosen) != 2 || chosen[0].path != jobs[1].path {
-		t.Fatalf("取消首个文件后应剩 2 项，实际 %+v", chosen)
+	if !strings.Contains(m.core.notice, "至少选择") {
+		t.Fatalf("notice = %q", m.core.notice)
 	}
 
-	if _, err := runSelector(jobs, strings.NewReader("q"), io.Discard, 80, 10); !errors.Is(err, ErrCancelled) {
-		t.Fatalf("按 Q 应返回 ErrCancelled，实际 %v", err)
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeySpace})
+	m, _ = m.update(tea.KeyMsg{Type: tea.KeyEnter})
+	if len(m.chosen) != 1 || m.chosen[0].path != "dir/file00.bin" {
+		t.Fatalf("重新选择后 chosen=%+v", m.chosen)
 	}
 }
 
-func TestRunSelectorRequiresAtLeastOne(t *testing.T) {
-	jobs := testJobs(3)
-	// A 取消全选 -> Enter 提示 -> 空格选中当前项 -> Enter 确认
-	chosen, err := runSelector(jobs, strings.NewReader("a\r \r"), io.Discard, 80, 10)
-	if err != nil {
-		t.Fatalf("选择流程失败: %v", err)
+func TestSelectionProgramViewContainsStyledTitle(t *testing.T) {
+	m := newSelectionProgramModel(testJobs(3), 80, 20)
+	view := m.View()
+	if !strings.Contains(view, "选择要包含在补丁中的文件") {
+		t.Fatalf("view missing title: %q", view)
 	}
-	if len(chosen) != 1 || chosen[0].path != jobs[0].path {
-		t.Fatalf("应只选中当前项，实际 %+v", chosen)
-	}
-}
-
-func TestRunSelectorHidesCursor(t *testing.T) {
-	var out strings.Builder
-	if _, err := runSelector(testJobs(2), strings.NewReader("\r"), &out, 80, 10); err != nil {
-		t.Fatal(err)
-	}
-	got := out.String()
-	if !strings.Contains(got, "\x1b[?25l") || !strings.Contains(got, "\x1b[?25h") {
-		t.Fatal("选择界面应隐藏并在退出时恢复光标")
+	if !strings.Contains(view, "Enter") {
+		t.Fatalf("view missing footer: %q", view)
 	}
 }

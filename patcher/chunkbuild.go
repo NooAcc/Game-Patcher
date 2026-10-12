@@ -9,6 +9,8 @@ import (
 	"sync"
 
 	"github.com/zeebo/blake3"
+
+	"game-patcher/adapter"
 )
 
 // blobPool 去重存放所有段的字面量块，键为块内容的 BLAKE3。
@@ -110,7 +112,42 @@ func (c *crossIndex) lookup(key [32]byte, size int) (crossRef, bool) {
 
 // buildChunkFileEntry 生成一个文件的重建操作（chunk 后端）。
 // oldPath 为空表示新增文件（没有本文件旧内容可复制）。
-func buildChunkFileEntry(oldPath, newPath, relPath string, cross *crossIndex, pool *blobPool) (*deltaResult, error) {
+type adapterFileMeta struct {
+	oldMeta fileMeta
+	newMeta fileMeta
+	options adapter.Options
+}
+
+func buildChunkFileEntry(oldPath, newPath, relPath string, cross *crossIndex, pool *blobPool, adapterArgs ...adapterFileMeta) (*deltaResult, error) {
+	var oldMeta, newMeta fileMeta
+	var adapterOptions adapter.Options
+	if len(adapterArgs) > 0 {
+		oldMeta = adapterArgs[0].oldMeta
+		newMeta = adapterArgs[0].newMeta
+		adapterOptions = adapterArgs[0].options
+	}
+
+	if oldPath != "" && len(adapterArgs) > 0 {
+		res, err := adapter.Build(adapter.BuildContext{Context: adapter.Context{
+			OldPath: oldPath,
+			NewPath: newPath,
+			RelPath: relPath,
+			OldSize: oldMeta.size,
+			NewSize: newMeta.size,
+			OldHash: oldMeta.hash,
+			NewHash: newMeta.hash,
+			Options: adapterOptions,
+		}})
+		if err != nil {
+			return nil, fmt.Errorf("适配器处理 %s 失败: %w", relPath, err)
+		}
+		if res.Accepted && res.Delta != nil {
+			return convertAdapterDelta(res.Delta, pool)
+		}
+		if res.Reason != "" {
+			fmt.Printf("ℹ️  适配器未采用 %s: %s（回退字节差分）\n", relPath, res.Reason)
+		}
+	}
 	var (
 		index   map[[32]byte]chunkRef
 		oldSize uint64
@@ -190,7 +227,12 @@ func buildChunkFileEntry(oldPath, newPath, relPath string, cross *crossIndex, po
 }
 
 // buildChunkStepEntries 为 oldDir→newDir 构建一段差异（chunk 后端）。
-func buildChunkStepEntries(oldDir, newDir string, jobs []treeJob, pool *blobPool) ([]Entry, error) {
+func buildChunkStepEntries(oldDir, newDir string, jobs []treeJob, pool *blobPool, adapterOptions ...adapter.Options) ([]Entry, error) {
+	var options adapter.Options
+	if len(adapterOptions) > 0 {
+		options = adapterOptions[0]
+	}
+
 	// 1) 索引本段被删除的文件，供新增/修改文件跨文件复用。
 	cross := newCrossIndex()
 	for i := range jobs {
@@ -209,7 +251,7 @@ func buildChunkStepEntries(oldDir, newDir string, jobs []treeJob, pool *blobPool
 		switch j.action {
 		case ActionAdd:
 			res, err := buildChunkFileEntry("",
-				filepath.Join(newDir, filepath.FromSlash(j.path)), j.path, cross, pool)
+				filepath.Join(newDir, filepath.FromSlash(j.path)), j.path, cross, pool, adapterFileMeta{oldMeta: fileMeta{}, newMeta: j.newMeta, options: options})
 			if err != nil {
 				return fmt.Errorf("处理新增文件 %s 失败: %w", j.path, err)
 			}
@@ -224,7 +266,7 @@ func buildChunkStepEntries(oldDir, newDir string, jobs []treeJob, pool *blobPool
 			res, err := buildChunkFileEntry(
 				filepath.Join(oldDir, filepath.FromSlash(j.path)),
 				filepath.Join(newDir, filepath.FromSlash(j.path)),
-				j.path, cross, pool,
+				j.path, cross, pool, adapterFileMeta{oldMeta: j.oldMeta, newMeta: j.newMeta, options: options},
 			)
 			if err != nil {
 				return fmt.Errorf("计算 %s 差异失败: %w", j.path, err)
@@ -252,4 +294,32 @@ func buildChunkStepEntries(oldDir, newDir string, jobs []treeJob, pool *blobPool
 		return nil, err
 	}
 	return entries, nil
+}
+
+// convertAdapterDelta 把适配器的中立操作转换为 GPBIN 内部操作。
+func convertAdapterDelta(fd *adapter.FileDelta, pool *blobPool) (*deltaResult, error) {
+	ops := make([]DeltaOp, 0, len(fd.Ops))
+	for i, op := range fd.Ops {
+		switch op.Kind {
+		case adapter.OpCopy:
+			ops = append(ops, DeltaOp{Kind: OpCopy, OldOffset: op.OldOffset, Length: op.Length})
+		case adapter.OpLiteral:
+			if uint64(len(op.Data)) != op.Length {
+				return nil, fmt.Errorf("适配器 literal %d 长度不匹配: data=%d length=%d", i, len(op.Data), op.Length)
+			}
+			idx := pool.intern(op.Data)
+			ops = append(ops, DeltaOp{Kind: OpPoolRef, PoolIndex: idx, Length: op.Length})
+		case adapter.OpCopyFrom:
+			ops = append(ops, DeltaOp{Kind: OpCopyFrom, SrcPath: op.SrcPath, OldOffset: op.OldOffset, Length: op.Length})
+		default:
+			return nil, fmt.Errorf("适配器操作 %d 类型非法: %d", i, op.Kind)
+		}
+	}
+	return &deltaResult{
+		OldHash: fd.OldHash,
+		NewHash: fd.NewHash,
+		OldSize: fd.OldSize,
+		NewSize: fd.NewSize,
+		Ops:     ops,
+	}, nil
 }

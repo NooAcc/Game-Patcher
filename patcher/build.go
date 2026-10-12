@@ -5,16 +5,19 @@ import (
 	"os"
 	"sort"
 	"time"
+
+	"game-patcher/adapter"
 )
 
 // CreatePatchOptions 描述一次补丁构建。
 type CreatePatchOptions struct {
-	BaseExe   string   // 升级工具基础程序
-	OldDir    string   // 旧版本目录（本次差异的源）
-	NewDir    string   // 新版本目录（本次差异的目标）
-	Output    string   // 输出升级工具路径
-	Restorer  string   // 可选：恢复工具二进制
-	PrevPaths []string // 可选：要附加的旧补丁
+	BaseExe        string          // 升级工具基础程序
+	OldDir         string          // 旧版本目录（本次差异的源）
+	NewDir         string          // 新版本目录（本次差异的目标）
+	Output         string          // 输出升级工具路径
+	Restorer       string          // 可选：恢复工具二进制
+	PrevPaths      []string        // 可选：要附加的旧补丁
+	AdapterOptions adapter.Options // 可选：引擎适配器配置
 }
 
 // CreatePatch 生成单段补丁（等价于不带旧补丁前缀）。
@@ -85,7 +88,7 @@ func CreatePatchWithOptions(opts CreatePatchOptions) error {
 	if prev != nil {
 		pool = blobPoolFrom(prev.Payload.Pool)
 	}
-	entries, err := buildChunkStepEntries(oldPath, newPath, selected, pool)
+	entries, err := buildChunkStepEntries(oldPath, newPath, selected, pool, opts.AdapterOptions)
 	if err != nil {
 		return err
 	}

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"game-patcher/adapter"
 )
 
 // tempWorkDir 创建带容错清理的临时目录。
@@ -201,5 +203,31 @@ func TestPromptPathAcceptsQuotedPath(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("promptPath = %q，期望 %q", got, want)
+	}
+}
+
+func TestBuildAdapterOptionsSelection(t *testing.T) {
+	opts, err := buildAdapterOptions("", "01293b8d0b5d4aec182f82456c5e3c2269702c1b527648c4a5c274232b40ad23")
+	if err != nil {
+		t.Fatalf("empty/default: %v", err)
+	}
+	if got := opts.Values[adapter.OptionSelected]; got != adapter.SelectedNone {
+		t.Fatalf("default selected = %q, want %q", got, adapter.SelectedNone)
+	}
+	if opts.Values["godot.key"] == "" {
+		t.Fatal("expected godot.key to be preserved even when adapters are disabled")
+	}
+	opts, err = buildAdapterOptions("godot", "01293b8d0b5d4aec182f82456c5e3c2269702c1b527648c4a5c274232b40ad23")
+	if err != nil {
+		t.Fatalf("godot: %v", err)
+	}
+	if got := opts.Values[adapter.OptionSelected]; got != "godot" {
+		t.Fatalf("godot selected = %q, want godot", got)
+	}
+	if _, err := buildAdapterOptions("missing-adapter", ""); err == nil {
+		t.Fatal("expected unknown adapter error")
+	}
+	if _, err := buildAdapterOptions("auto", ""); err == nil {
+		t.Fatal("auto must be rejected after auto mode removal")
 	}
 }

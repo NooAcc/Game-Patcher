@@ -1,13 +1,13 @@
 package patcher
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"golang.org/x/term"
 )
 
@@ -199,106 +199,185 @@ func truncateRunes(s string, width int) string {
 	return string(runes[:width-1]) + "…"
 }
 
-// readSelectorKey 从输入流读取一个按键。方向键在 Windows 控制台以 ESC [ A/B 到达。
-func readSelectorKey(r *bufio.Reader) (keyKind, error) {
-	b, err := r.ReadByte()
-	if err != nil {
-		return keyNone, err
+type selectionProgramModel struct {
+	core      *selectionModel
+	width     int
+	height    int
+	chosen    []treeJob
+	cancelled bool
+}
+
+var (
+	selectionTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.AdaptiveColor{Light: "#6D28D9", Dark: "#C4B5FD"})
+	selectionMetaStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.AdaptiveColor{Light: "#64748B", Dark: "#94A3B8"})
+	selectionSelectedStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.AdaptiveColor{Light: "#0E7490", Dark: "#67E8F9"})
+	selectionAddedStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.AdaptiveColor{Light: "#15803D", Dark: "#86EFAC"})
+	selectionDeletedStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.AdaptiveColor{Light: "#B91C1C", Dark: "#FCA5A5"})
+	selectionNoticeStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.AdaptiveColor{Light: "#B91C1C", Dark: "#FCA5A5"})
+	selectionBorderStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.AdaptiveColor{Light: "#CBD5E1", Dark: "#334155"}).
+				Padding(1, 2)
+)
+
+func newSelectionProgramModel(jobs []treeJob, width, height int) selectionProgramModel {
+	if width < 60 {
+		width = 60
 	}
-	switch b {
-	case ' ':
-		return keySpace, nil
-	case '\r', '\n':
-		return keyEnter, nil
-	case 'a', 'A':
-		return keyToggleAll, nil
-	case 'q', 'Q', 3: // Ctrl+C 在 raw 模式下以 0x03 到达
-		return keyCancel, nil
-	case 'k', 'K':
-		return keyUp, nil
-	case 'j', 'J':
-		return keyDown, nil
-	case 0x1b:
-		if r.Buffered() == 0 {
-			return keyCancel, nil
-		}
-		next, err := r.ReadByte()
-		if err != nil || (next != '[' && next != 'O') {
-			return keyCancel, nil
-		}
-		code, err := r.ReadByte()
-		if err != nil {
-			return keyNone, err
-		}
-		switch code {
-		case 'A':
-			return keyUp, nil
-		case 'B':
-			return keyDown, nil
-		default:
-			return keyNone, nil
-		}
-	default:
-		return keyNone, nil
+	rows := clampInt(height-8, selectorMinRows, selectorMaxRows)
+	if rows > len(jobs) {
+		rows = len(jobs)
+	}
+	if rows < 1 {
+		rows = 1
+	}
+	return selectionProgramModel{
+		core:   newSelectionModel(jobs, rows),
+		width:  width,
+		height: height,
 	}
 }
 
-// selectorScreen 负责重绘：每次把上一次输出的行数上移后覆盖。
-type selectorScreen struct {
-	w     io.Writer
-	lines int
+func (m selectionProgramModel) Init() tea.Cmd { return nil }
+
+func (m selectionProgramModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.update(msg)
+	return next, cmd
 }
 
-func (s *selectorScreen) draw(lines []string) {
-	var b strings.Builder
-	if s.lines > 0 {
-		fmt.Fprintf(&b, "\x1b[%dA", s.lines)
-	}
-	for _, line := range lines {
-		b.WriteString("\r\x1b[2K")
-		b.WriteString(line)
-		b.WriteString("\n")
-	}
-	for i := len(lines); i < s.lines; i++ {
-		b.WriteString("\r\x1b[2K\n")
-	}
-	s.lines = len(lines)
-	_, _ = io.WriteString(s.w, b.String())
-}
-
-// runSelector 运行选择循环，输入输出可替换，便于测试。
-func runSelector(jobs []treeJob, in io.Reader, out io.Writer, width, rows int) ([]treeJob, error) {
-	m := newSelectionModel(jobs, rows)
-	screen := &selectorScreen{w: out}
-	_, _ = io.WriteString(out, "\x1b[?25l")
-	defer func() { _, _ = io.WriteString(out, "\x1b[?25h") }()
-	screen.draw(m.render(width))
-
-	reader := bufio.NewReader(in)
-	for {
-		key, err := readSelectorKey(reader)
-		if err != nil {
-			return nil, err
-		}
-		switch key {
-		case keyUp:
-			m.move(-1)
-		case keyDown:
-			m.move(1)
-		case keySpace:
-			m.toggle()
-		case keyToggleAll:
-			m.toggleAll()
-		case keyCancel:
-			return nil, ErrCancelled
-		case keyEnter:
-			if m.count() == 0 {
-				m.notice = "至少选择一个文件"
-				break
+func (m selectionProgramModel) update(msg tea.Msg) (selectionProgramModel, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.resize()
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "up", "k":
+			m.core.move(-1)
+		case "down", "j":
+			m.core.move(1)
+		case " ":
+			m.core.toggle()
+		case "a", "A":
+			m.core.toggleAll()
+		case "enter":
+			if m.core.count() == 0 {
+				m.core.notice = "至少选择一个文件"
+				return m, nil
 			}
-			return m.chosen(), nil
+			m.chosen = m.core.chosen()
+			return m, tea.Quit
+		case "q", "esc", "ctrl+c":
+			m.cancelled = true
+			return m, tea.Quit
 		}
-		screen.draw(m.render(width))
+	}
+	return m, nil
+}
+
+func (m *selectionProgramModel) resize() {
+	rows := clampInt(m.height-8, selectorMinRows, selectorMaxRows)
+	if rows > len(m.core.jobs) {
+		rows = len(m.core.jobs)
+	}
+	if rows < 1 {
+		rows = 1
+	}
+	m.core.rows = rows
+	if m.core.cursor >= m.core.offset+m.core.rows {
+		m.core.offset = m.core.cursor - m.core.rows + 1
+	}
+	if m.core.offset < 0 {
+		m.core.offset = 0
+	}
+}
+
+func (m selectionProgramModel) View() string {
+	width := m.width - 8
+	if width < 50 {
+		width = 50
+	}
+	if width > 120 {
+		width = 120
+	}
+
+	added, updated, deleted := m.actionCounts()
+	meta := fmt.Sprintf("已选 %d/%d    新增 %d    修改 %d    删除 %d", m.core.count(), len(m.core.jobs), added, updated, deleted)
+	lines := []string{
+		selectionTitleStyle.Render("选择要包含在补丁中的文件"),
+		selectionMetaStyle.Render(meta),
+		strings.Repeat("─", clampInt(width-4, 20, 116)),
+	}
+	end := m.core.offset + m.core.rows
+	if end > len(m.core.jobs) {
+		end = len(m.core.jobs)
+	}
+	for i := m.core.offset; i < end; i++ {
+		lines = append(lines, m.row(i, width-4))
+	}
+	lines = append(lines, strings.Repeat("─", clampInt(width-4, 20, 116)))
+	if m.core.notice != "" {
+		lines = append(lines, selectionNoticeStyle.Render("⚠ "+m.core.notice))
+	} else {
+		lines = append(lines, selectionMetaStyle.Render("↑/↓ 或 j/k 移动    Space 选择/取消    A 全选/反选    Enter 确认    Q 取消"))
+	}
+	return selectionBorderStyle.Width(width).Render(strings.Join(lines, "\n"))
+}
+
+func (m selectionProgramModel) actionCounts() (added, updated, deleted int) {
+	for _, job := range m.core.jobs {
+		switch job.action {
+		case ActionAdd:
+			added++
+		case ActionDelete:
+			deleted++
+		default:
+			updated++
+		}
+	}
+	return
+}
+
+func (m selectionProgramModel) row(i, width int) string {
+	job := &m.core.jobs[i]
+	cursor := "  "
+	if i == m.core.cursor {
+		cursor = "❯ "
+	}
+	check := "○"
+	if m.core.selected[i] {
+		check = "●"
+	}
+	action := "~"
+	switch job.action {
+	case ActionAdd:
+		action = "+"
+	case ActionDelete:
+		action = "-"
+	}
+	line := truncateRunes(fmt.Sprintf("%s%s %s %s   %s", cursor, check, action, job.path, formatJobSize(job)), width)
+	if i == m.core.cursor {
+		return selectionSelectedStyle.Render(line)
+	}
+	switch job.action {
+	case ActionAdd:
+		return selectionAddedStyle.Render(line)
+	case ActionDelete:
+		return selectionDeletedStyle.Render(line)
+	default:
+		return line
 	}
 }
 
@@ -322,25 +401,23 @@ func selectJobs(jobs []treeJob) ([]treeJob, error) {
 		height = 25
 	}
 
-	oldState, err := term.MakeRaw(inFd)
+	program := tea.NewProgram(newSelectionProgramModel(jobs, width, height), tea.WithAltScreen())
+	finalModel, err := program.Run()
 	if err != nil {
 		return nil, fmt.Errorf("无法进入交互选择模式: %w", err)
 	}
-	restored := false
-	restore := func() {
-		if !restored {
-			_ = term.Restore(inFd, oldState)
-			restored = true
-		}
+	final, ok := finalModel.(selectionProgramModel)
+	if !ok {
+		return nil, errors.New("文件选择界面返回了未知模型")
 	}
-	defer restore()
-
-	chosen, selErr := runSelector(jobs, os.Stdin, os.Stdout, width, height-5)
-	restore()
+	if final.cancelled {
+		return nil, ErrCancelled
+	}
+	chosen := final.chosen
+	if chosen == nil {
+		chosen = jobs
+	}
 	fmt.Fprintln(os.Stdout)
-	if selErr != nil {
-		return nil, selErr
-	}
 	if excluded := len(jobs) - len(chosen); excluded > 0 {
 		fmt.Printf("✅ 已选择 %d 个文件，排除 %d 个文件。\n", len(chosen), excluded)
 	} else {
