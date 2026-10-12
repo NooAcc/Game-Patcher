@@ -277,3 +277,4 @@ adapter/
 
 - 2026-10-12：完成 Bubble Tea 迁移。CLI 配置向导和变更文件选择器均改用 Bubble Tea；`cmd/cli/menu.go` 与 `patcher/select.go` 不再使用手写 raw mode/ANSI 重绘。`go test ./...`、`go vet ./...` 通过，真实终端验收待执行。
 - 2026-10-12：真实终端验收完成。`-shell` 全屏向导正常渲染并支持取消；脚本模式进入 Bubble Tea 文件选择器，Enter 确认后生成 13.15 MB Godot 补丁。`go test ./...`、`go vet ./...`、`git diff --check` 均通过。
+- 2026-10-12：Bubble Tea TUI 与 adapter 架构升级提交为 `82f7fe2`，并已推送到 `origin/main`。
