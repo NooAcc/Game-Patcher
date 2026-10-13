@@ -163,6 +163,10 @@ type deltaResult struct {
 	OldSize uint64
 	NewSize uint64
 	Ops     []DeltaOp
+	// Rewriter 非空表示 Ops 作用于该适配器“解码后的逻辑内容”，
+	// 应用端需要重新编码才能得到最终文件；Meta 为适配器私有的编码参数。
+	Rewriter string
+	Meta     []byte
 }
 
 // indexChunks 为旧文件建立 分块哈希 -> 偏移 索引，同时计算整文件哈希。
@@ -175,7 +179,18 @@ func indexChunks(path string) (map[[32]byte]chunkRef, uint64, [32]byte, error) {
 	defer f.Close()
 
 	hasher := blake3.New()
-	sc := newChunkScanner(io.TeeReader(f, hasher))
+	index, size, err := indexChunksFrom(io.TeeReader(f, hasher))
+	if err != nil {
+		return nil, 0, sum, err
+	}
+	copy(sum[:], hasher.Sum(nil))
+	return index, size, sum, nil
+}
+
+// indexChunksFrom 与 indexChunks 相同，但作用于任意顺序读取器，
+// 用于对适配器解码后的逻辑内容建立索引。
+func indexChunksFrom(r io.Reader) (map[[32]byte]chunkRef, uint64, error) {
+	sc := newChunkScanner(r)
 	index := make(map[[32]byte]chunkRef)
 	var offset uint64
 	for {
@@ -184,7 +199,7 @@ func indexChunks(path string) (map[[32]byte]chunkRef, uint64, [32]byte, error) {
 			break
 		}
 		if err != nil {
-			return nil, 0, sum, err
+			return nil, 0, err
 		}
 		h := blake3.Sum256(ch)
 		if _, ok := index[h]; !ok {
@@ -192,8 +207,7 @@ func indexChunks(path string) (map[[32]byte]chunkRef, uint64, [32]byte, error) {
 		}
 		offset += uint64(len(ch))
 	}
-	copy(sum[:], hasher.Sum(nil))
-	return index, offset, sum, nil
+	return index, offset, nil
 }
 
 // appendCopyOp 追加 COPY 操作，并合并旧文件与新文件都相邻的连续 COPY。
@@ -278,38 +292,59 @@ func (d *literalDecoder) close() {
 	}
 }
 
+// readerAtSource 是 COPY 操作的来源：既支持随机读取，也知道总长度。
+// *os.File 包装与 adapter.DecodedFile 都满足该接口。
+type readerAtSource interface {
+	io.ReaderAt
+	Size() int64
+}
+
+// fileSource 把已打开的文件包装成 readerAtSource。
+type fileSource struct {
+	f    *os.File
+	size int64
+}
+
+func (s fileSource) ReadAt(p []byte, off int64) (int, error) { return s.f.ReadAt(p, off) }
+func (s fileSource) Size() int64                             { return s.size }
+
 // applyOps 将 ops 应用到 oldPath，结果写入 dst。
 // oldPath 为空表示没有本文件的旧内容可复制（新增文件）。
 func applyOps(ctx opContext, oldPath string, ops []DeltaOp, dst io.Writer) error {
-	var (
-		oldFile *os.File
-		oldSize uint64
-	)
-	if oldPath != "" {
-		f, err := os.Open(oldPath)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		fi, err := f.Stat()
-		if err != nil {
-			return err
-		}
-		oldFile = f
-		oldSize = uint64(fi.Size())
+	if oldPath == "" {
+		return applyOpsFrom(ctx, nil, ops, dst)
+	}
+	f, err := os.Open(oldPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return applyOpsFrom(ctx, fileSource{f: f, size: fi.Size()}, ops, dst)
+}
+
+// applyOpsFrom 是 applyOps 的核心实现；src 为 nil 表示没有旧内容可复制。
+// 适配器重写管线会传入解码后的逻辑内容视图，因此 COPY 偏移落在逻辑域。
+func applyOpsFrom(ctx opContext, src readerAtSource, ops []DeltaOp, dst io.Writer) error {
+	var oldSize uint64
+	if src != nil {
+		oldSize = uint64(src.Size())
 	}
 
 	for i := range ops {
 		op := &ops[i]
 		switch op.Kind {
 		case OpCopy:
-			if oldFile == nil {
+			if src == nil {
 				return fmt.Errorf("操作 %d 需要旧文件，但未提供", i)
 			}
 			if op.OldOffset > oldSize || op.Length > oldSize-op.OldOffset {
 				return fmt.Errorf("COPY 越界: offset=%d length=%d oldSize=%d", op.OldOffset, op.Length, oldSize)
 			}
-			sr := io.NewSectionReader(oldFile, int64(op.OldOffset), int64(op.Length))
+			sr := io.NewSectionReader(src, int64(op.OldOffset), int64(op.Length))
 			if _, err := io.CopyN(dst, sr, int64(op.Length)); err != nil {
 				return fmt.Errorf("复制旧文件区段失败: %w", err)
 			}

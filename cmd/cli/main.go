@@ -435,6 +435,7 @@ func printUsage() {
 	fmt.Println("  非交互终端（管道/CI）会自动包含全部变更文件。")
 	fmt.Println("  补丁使用共享块池，并复用被删除文件的块；重命名/移动大文件时体积显著更小。")
 	fmt.Println("  -adapter 选择引擎适配器：none 禁用（默认），或指定具体适配器名称。")
+	fmt.Println("           unity：UnityFS(.unity3d/bundle) 在解压后的逻辑流上差分并重编码，大幅减小补丁。")
 	fmt.Println("  -godot-key 用于 Godot 加密 PCK：未变化文件直接复用旧 PCK blob，大幅减小补丁。")
 	fmt.Println("  非 Godot、key 缺失或 PCK 自定义保护时会自动回退普通字节差分。")
 	fmt.Printf("平台: %s/%s\n", runtime.GOOS, runtime.GOARCH)

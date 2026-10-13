@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"sort"
 
 	"game-patcher/adapter"
 )
@@ -31,9 +32,14 @@ func adapterSelectionDisplay(value string) string {
 }
 
 func adapterMenuItems() []adaptMenuItem {
-	items := make([]adaptMenuItem, 0, len(adapter.DefaultRegistry.Adapters())+1)
+	adapters := adapter.DefaultRegistry.Adapters()
+	// 注册顺序由包的初始化顺序决定（Go 未规定独立包之间的顺序），
+	// 这里按名称排序，保证交互列表稳定。
+	sort.Slice(adapters, func(i, j int) bool { return adapters[i].Name() < adapters[j].Name() })
+
+	items := make([]adaptMenuItem, 0, len(adapters)+1)
 	items = append(items, adaptMenuItem{Label: "禁用适配器（强制通用 CDC）", Value: adapter.SelectedNone})
-	for _, a := range adapter.DefaultRegistry.Adapters() {
+	for _, a := range adapters {
 		items = append(items, adaptMenuItem{Label: adapter.DisplayName(a), Value: a.Name()})
 	}
 	return items

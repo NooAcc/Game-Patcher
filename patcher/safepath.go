@@ -57,3 +57,18 @@ func SafeJoin(root, rel string) (string, error) {
 	}
 	return joined, nil
 }
+
+// validateAdapterName 校验适配器名：仅允许字母、数字、'-'、'_'，长度 1..64。
+func validateAdapterName(name string) error {
+	if len(name) == 0 || len(name) > 64 {
+		return fmt.Errorf("长度非法: %d", len(name))
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return fmt.Errorf("含非法字符 %q", r)
+		}
+	}
+	return nil
+}

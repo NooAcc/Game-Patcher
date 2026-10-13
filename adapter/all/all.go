@@ -3,4 +3,5 @@ package all
 
 import (
 	_ "game-patcher/adapter/godot"
+	_ "game-patcher/adapter/unity"
 )

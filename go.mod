@@ -7,6 +7,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/klauspost/compress v1.20.1
+	github.com/pierrec/lz4/v4 v4.1.33
 	github.com/zeebo/blake3 v0.2.4
 	golang.org/x/term v0.40.0
 )

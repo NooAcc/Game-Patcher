@@ -106,8 +106,8 @@ func (c *ChunkPayload) Encode(w io.Writer) error {
 	return e.err
 }
 
-func decodeChunkPayload(d *decoder) (*ChunkPayload, error) {
-	steps, err := decodeSteps(d)
+func decodeChunkPayload(d *decoder, ver int) (*ChunkPayload, error) {
+	steps, err := decodeSteps(d, ver)
 	if err != nil {
 		return nil, err
 	}

@@ -22,8 +22,13 @@ const (
 	patchEndMagic = "GPBIN4END!"
 	restorerMagic = "GPBIN4RST!"
 
-	// formatVersion 是补丁制品的线格式版本。5 起版本链不再携带版本名称（Label）。
-	formatVersion = 5
+	// formatVersion 是补丁制品的线格式版本。
+	//   5 起版本链不再携带版本名称（Label）；
+	//   6 起 Entry 增加适配器名字段（逻辑内容重写），旧版 v5 仍可读取。
+	formatVersion = 6
+
+	// prevFormatVersion 是仍可读的上一个线格式版本（无适配器名字段）。
+	prevFormatVersion = 5
 
 	// legacyFormatVersion 是仍携带版本名称的旧线格式，仅用于给出明确的迁移提示。
 	legacyFormatVersion = 4
@@ -93,6 +98,13 @@ type Entry struct {
 	OldSize uint64
 	NewSize uint64
 	Ops     []DeltaOp
+	// Adapter 非空时表示 Ops 作用在该适配器“解码后的逻辑内容”上：
+	// 应用端需要先用该适配器 Decode 旧文件、套用 Ops，再 Encode 成最终文件。
+	// 为空表示 Ops 直接作用在原始文件字节上（默认行为）。
+	Adapter string
+	// AdapterMeta 是适配器私有的编码参数（Build 时由 RewriteSpec.Meta 给出），
+	// 应用端原样交回适配器 Encode。仅当 Adapter 非空时有意义。
+	AdapterMeta []byte
 }
 
 // EncodeRelease 将一份补丁制品写入 w。
@@ -129,7 +141,7 @@ func DecodeRelease(data []byte) (*Release, error) {
 	if ver == legacyFormatVersion {
 		return nil, fmt.Errorf("该补丁使用已淘汰的旧格式（v%d），请用当前版本的 CLI 重新生成补丁", ver)
 	}
-	if ver != formatVersion {
+	if ver != formatVersion && ver != prevFormatVersion {
 		return nil, fmt.Errorf("不支持的补丁格式版本: %d", ver)
 	}
 	kind, err := d.u8()
@@ -144,7 +156,7 @@ func DecodeRelease(data []byte) (*Release, error) {
 	var payload *ChunkPayload
 	switch PayloadKind(kind) {
 	case PayloadChunk:
-		payload, err = decodeChunkPayload(d)
+		payload, err = decodeChunkPayload(d, int(ver))
 	default:
 		return nil, fmt.Errorf("不支持的差异后端类型: %d", kind)
 	}
@@ -167,6 +179,17 @@ func encodeEntry(e *encWriter, en *Entry) {
 		return
 	}
 	e.str(en.Path)
+	if en.Adapter != "" {
+		if err := validateAdapterName(en.Adapter); err != nil {
+			e.fail(fmt.Errorf("条目 %s 适配器名非法: %w", en.Path, err))
+			return
+		}
+	}
+	e.str(en.Adapter)
+	if en.Adapter != "" {
+		e.u32(uint32(len(en.AdapterMeta)))
+		e.raw(en.AdapterMeta)
+	}
 	e.u8(byte(en.Action))
 	e.raw(en.OldHash[:])
 	e.raw(en.NewHash[:])
@@ -212,7 +235,7 @@ func encodeOp(e *encWriter, op *DeltaOp) {
 	}
 }
 
-func decodeEntry(d *decoder) (Entry, error) {
+func decodeEntry(d *decoder, ver int) (Entry, error) {
 	var en Entry
 	path, err := d.str()
 	if err != nil {
@@ -222,6 +245,32 @@ func decodeEntry(d *decoder) (Entry, error) {
 		return en, fmt.Errorf("路径非法: %w", err)
 	}
 	en.Path = path
+	if ver >= 6 {
+		name, err := d.str()
+		if err != nil {
+			return en, fmt.Errorf("适配器名: %w", err)
+		}
+		if name != "" {
+			if err := validateAdapterName(name); err != nil {
+				return en, fmt.Errorf("适配器名非法: %w", err)
+			}
+		}
+		en.Adapter = name
+		if name != "" {
+			n, err := d.u32()
+			if err != nil {
+				return en, fmt.Errorf("适配器参数: %w", err)
+			}
+			if uint64(n) > uint64(d.remaining()) {
+				return en, fmt.Errorf("适配器参数越界: %d（剩余 %d）", n, d.remaining())
+			}
+			meta, err := d.raw(int(n))
+			if err != nil {
+				return en, err
+			}
+			en.AdapterMeta = append([]byte(nil), meta...)
+		}
+	}
 	action, err := d.u8()
 	if err != nil {
 		return en, err

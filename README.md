@@ -93,9 +93,14 @@ game-patcher-cli-win64.exe -shell     # 显式进入交互模式
 
 把生成的升级工具放到**游戏根目录**，直接运行即可。
 
-## Godot PCK 增量优化（adapter）
+## 引擎适配器（adapter）
 
-项目新增 `adapter/` 适配器层，用于放置不同引擎的容器级增量适配器。首个内置适配器为 **Godot PCK**。
+`adapter/` 适配器层用于放置不同引擎的容器级增量适配器。当前内置两个适配器：
+
+| 适配器 | 名称 | 说明 |
+| --- | --- | --- |
+| Godot PCK | `godot` | 按 PCK 目录条目复用未变化文件，变化/新增文件才进入补丁 |
+| Unity3D 资源包 | `unity` | 在 UnityFS 解压后的逻辑流上做差分，应用端重新编码容器 |
 
 交互模式下，填写完“旧版本文件夹、新版本文件夹、附加旧补丁”后，会出现适配器选择菜单：
 
@@ -127,6 +132,46 @@ game-patcher-cli-win64.exe -old ./v1 -new ./v2 -out ./updater.exe \
 - 重建后的 exe 可能与官方新版 exe 逐字节不同；游戏必须接受重建后的 PCK。
 - 多版本链建议使用“应用补丁后的结果”作为下一次 `-old`，不要直接使用官方新版目录，除非后续版本检测引入逻辑指纹。
 - 实测 `temp` 中的 Godot 测试游戏：补丁 **139.64 MiB -> 13.15 MiB**；应用后 1983/1983 个逻辑文件与官方新版一致。
+
+## Unity3D 资源包增量优化（`-adapter unity`）
+
+Unity 游戏的 `data.unity3d` / `*.bundle` 是 **UnityFS** 容器：内容被切成固定
+128 KiB 块，每块单独 LZ4 压缩。这种布局对“整体位移”极度敏感——只要资源包中间
+某个节点变长，后续内容就会整体位移，而块边界仍按流起点对齐，于是**后面每一个块的
+压缩字节都会改变**。现有 CDC 是在压缩后的字节上做差分的，因此只能复用极小一部分，
+补丁接近整包大小。
+
+`unity` 适配器把差分搬到解压后的逻辑流上：
+
+```bash
+game-patcher-cli-win64.exe -old ./v1 -new ./v2 -out ./updater.exe -adapter unity
+```
+
+工作方式：
+
+- 生成端解析新旧 UnityFS 容器（头 / 块表 / 节点表），把每个块按需解压成连续逻辑流；
+- 在逻辑流上做与通用后端相同的 CDC 差分（因此对插入、删除、位移不敏感）；
+- 应用端先用同一适配器解压玩家旧文件，套用差异，再把逻辑流**重新编码**成 UnityFS 容器；
+- 重建时沿用官方容器的版本号、引擎版本字符串、flags、节点表与 128 KiB 块布局，
+  只重算块负载与块表，因此重建产物的逻辑内容与官方新版**逐字节一致**。
+
+实测（`temp/old/data.unity3d` 692,995,605 B → `temp/new/data.unity3d` 639,769,574 B）：
+
+| 方案 | 补丁 EXE | 重建文件 | 构建耗时 | 升级耗时 |
+| --- | --- | --- | --- | --- |
+| 通用 CDC（压缩域） | 522.91 MB | 不变 | 6.8 s | 快 |
+| `unity` 适配器 | **30.34 MB** | 655.7 MB（+2.5%） | 42.5 s | 38.1 s |
+
+> 重建后体积略增，是因为内置 LZ4 压缩率不如官方使用的 LZ4HC；逻辑内容完全一致。
+> 提升压缩率会显著变慢，适配器默认采用速度与体积折中的高压缩率档位。
+
+限制：
+
+- 复用需要适配器参与：**旧补丁若用 `-adapter unity` 生成，链式补丁的 `-old` 应使用
+  应用补丁后的结果目录**，而不是官方新版目录（与 Godot 适配器同一约束）。
+- 仅支持 `UnityFS` v7 及以上、且块压缩为 `none` / `LZ4` / `LZ4HC` 的容器；
+  其余情况（含 LZMA、`UnityWeb`/`UnityRaw`）自动回退通用 CDC。
+- 应用端需要可定位的输出，并在应用时重新压缩，因此升级耗时比普通补丁长。
 
 ## 多版本升级（补丁链）
 
@@ -200,7 +245,7 @@ restorer.exe
 ├────────────────────────────────────────────┤
 │  GPBIN4 制品                                │
 │    "GPBIN4"       6B                        │
-│    formatVersion  1B (=5)                   │
+│    formatVersion  1B (=6)                   │
 │    payloadKind    1B (=2)                   │
 │    patchVersion   uint32 LE  补丁版本号      │
 │    stepCount      uint32 LE                 │
@@ -226,6 +271,8 @@ restorer.exe
 
 ```
 pathLen uint32 + path
+adapterLen uint32 + adapterName   (formatVersion >= 6；空表示普通字节差分)
+adapterMetaLen uint32 + adapterMeta  (仅当 adapterName 非空)
 action  uint8 (1=add 2=update 3=delete)
 oldHash [32]byte BLAKE3
 newHash [32]byte BLAKE3
@@ -234,6 +281,9 @@ newSize uint64
 opCount uint32
 Op[]
 ```
+
+`adapterName` 非空表示 `Op[]` 作用在该适配器**解码后的逻辑内容**上，应用端需要先
+用该适配器解压旧文件、套用差分，再重新编码为最终文件。
 
 每个 `Op`（`kind uint8` 开头）：
 
@@ -262,6 +312,10 @@ Op[]
 │   ├── cli/          # 补丁生成 CLI
 │   ├── upgrader/     # 升级工具模板
 │   └── restorer/     # 恢复工具
+├── adapter/
+│   ├── adapter.go    # 适配器接口、注册表、逻辑内容重写（Rewriter）
+│   ├── godot/        # Godot PCK 适配器
+│   └── unity/        # UnityFS 适配器（解析 / 按需解压 / 重编码）
 ├── patcher/
 │   ├── model.go      # FileState / VersionRef / Release / Payload 契约
 │   ├── format.go     # GPBIN4 制品信封、边界安全编解码
@@ -295,7 +349,8 @@ go test ./...          # 含 test/app.asar(.orig) 的真实集成与端到端 EX
 
 ## 兼容性
 
-- 当前版本使用 `GPBIN4` 链式制品格式（支持多版本），线格式版本 `formatVersion=5`。
+- 当前版本使用 `GPBIN4` 链式制品格式（支持多版本），线格式版本 `formatVersion=6`。
+- `formatVersion=6` 起 `Entry` 增加适配器名与适配器参数（逻辑内容重写）；`formatVersion=5` 仍可正常读取。
 - 读到 `formatVersion=4` 的旧制品会被明确拒绝并提示用当前 CLI 重新生成（旧版会写入版本名称字段）。
 - **不兼容** `GPBIN3` / `GPBIN2` 生成的旧补丁（已发布的旧 EXE 自带旧代码不受影响，但新 CLI 无法把旧补丁作为 `-prev` 读取）；`GAMEPATCH1` 同样不再支持。
 - 仅支持目录模式：`-old` / `-new` 必须是目录。

@@ -2,9 +2,12 @@ package patcher
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
+
+	"game-patcher/adapter"
 )
 
 // prepareBackupDir 准备备份目录；若已存在且非空，则改名为带时间戳的目录保留。
@@ -133,12 +136,12 @@ func applyEntries(gameDir string, entries []Entry, pool []Blob, dec *literalDeco
 			switch e.Action {
 			case ActionAdd:
 				fmt.Printf("      %s + %s\n", tag, e.Path)
-				if err := materialize(ctx, target, "", e.Ops, e.NewHash, e.NewSize); err != nil {
+				if err := materialize(ctx, target, "", e); err != nil {
 					return fmt.Errorf("新增 %s 失败: %w", e.Path, err)
 				}
 			case ActionUpdate:
 				fmt.Printf("      %s ~ %s\n", tag, e.Path)
-				if err := materialize(ctx, target, target, e.Ops, e.NewHash, e.NewSize); err != nil {
+				if err := materialize(ctx, target, target, e); err != nil {
 					return fmt.Errorf("更新 %s 失败: %w", e.Path, err)
 				}
 			case ActionDelete:
@@ -192,7 +195,7 @@ func ApplyRelease(gameDir, backupDir string, stages []Stage) (*RestoreManifest, 
 }
 
 // materialize 先在临时文件中重建目标，校验哈希后再原子替换。
-func materialize(ctx opContext, dst, oldPath string, ops []DeltaOp, wantHash [32]byte, wantSize uint64) error {
+func materialize(ctx opContext, dst, oldPath string, e *Entry) error {
 	dir := filepath.Dir(dst)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
@@ -207,7 +210,11 @@ func materialize(ctx opContext, dst, oldPath string, ops []DeltaOp, wantHash [32
 		os.Remove(tmpName)
 		return err
 	}
-	if err := applyOps(ctx, oldPath, ops, tmp); err != nil {
+	if e.Adapter == "" {
+		if err := applyOps(ctx, oldPath, e.Ops, tmp); err != nil {
+			return fail(err)
+		}
+	} else if err := encodeWithRewriter(ctx, e.Adapter, e.AdapterMeta, oldPath, e.Ops, tmp); err != nil {
 		return fail(err)
 	}
 	if err := tmp.Sync(); err != nil {
@@ -222,16 +229,16 @@ func materialize(ctx opContext, dst, oldPath string, ops []DeltaOp, wantHash [32
 		os.Remove(tmpName)
 		return err
 	}
-	if uint64(fi.Size()) != wantSize {
+	if uint64(fi.Size()) != e.NewSize {
 		os.Remove(tmpName)
-		return fmt.Errorf("大小校验失败: 期望 %d，实际 %d", wantSize, fi.Size())
+		return fmt.Errorf("大小校验失败: 期望 %d，实际 %d", e.NewSize, fi.Size())
 	}
 	got, err := HashFile(tmpName)
 	if err != nil {
 		os.Remove(tmpName)
 		return err
 	}
-	if got != wantHash {
+	if got != e.NewHash {
 		os.Remove(tmpName)
 		return fmt.Errorf("哈希校验失败")
 	}
@@ -240,4 +247,26 @@ func materialize(ctx opContext, dst, oldPath string, ops []DeltaOp, wantHash [32
 		return err
 	}
 	return nil
+}
+
+// encodeWithRewriter 先解码旧文件、套用逻辑域 ops，再按适配器重新编码为最终文件。
+func encodeWithRewriter(ctx opContext, name string, meta []byte, oldPath string, ops []DeltaOp, dst io.Writer) error {
+	rw, ok := adapter.FindRewriter(name)
+	if !ok {
+		return fmt.Errorf("此补丁需要适配器 %q，但当前程序未内置该适配器", name)
+	}
+	if oldPath == "" {
+		return fmt.Errorf("适配器 %q 需要旧文件才能重建", name)
+	}
+	src, err := rw.Decode(oldPath)
+	if err != nil {
+		return fmt.Errorf("解码旧文件失败: %w", err)
+	}
+	defer src.Close()
+
+	sink, ok := dst.(io.WriteSeeker)
+	if !ok {
+		return fmt.Errorf("适配器 %q 需要可定位的输出", name)
+	}
+	return encodeRewrittenTo(rw, sink, ctx, src, ops, meta)
 }

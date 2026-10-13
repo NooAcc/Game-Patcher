@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"os"
 
+	// 注册内置引擎适配器：应用端需要它们来重建被重写的容器文件。
+	_ "game-patcher/adapter/all"
+
 	"game-patcher/patcher"
 )
 
