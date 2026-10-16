@@ -14,24 +14,9 @@ import (
 
 	"game-patcher/adapter"
 	_ "game-patcher/adapter/all"
+	"game-patcher/internal/cliutil"
 	"game-patcher/patcher"
 )
-
-var upgraderCandidates = []string{
-	"game-patcher-upgrader-win64.exe",
-	"game-patcher-upgrader-win64",
-	"game-patcher-upgrader.exe",
-	"game-patcher-upgrader",
-	"upgrader.exe",
-	"upgrader",
-}
-
-var restorerCandidates = []string{
-	"restorer-win64.exe",
-	"restorer-win64",
-	"restorer.exe",
-	"restorer",
-}
 
 // stringList 支持重复传入与逗号分隔的字符串参数。
 type stringList []string
@@ -39,46 +24,12 @@ type stringList []string
 func (s *stringList) String() string { return strings.Join(*s, ",") }
 
 func (s *stringList) Set(v string) error {
-	for _, part := range splitPathList(v) {
-		if part = cleanPath(part); part != "" {
+	for _, part := range cliutil.SplitPathList(v) {
+		if part = cliutil.CleanPath(part); part != "" {
 			*s = append(*s, part)
 		}
 	}
 	return nil
-}
-
-// splitPathList 按逗号拆分列表，但忽略双引号内部的逗号
-// （从资源管理器复制的路径可能形如 "D:\Games, Inc\v1"）。
-func splitPathList(s string) []string {
-	parts := make([]string, 0, 1)
-	var cur strings.Builder
-	inQuote := false
-	for _, r := range s {
-		switch {
-		case r == '"':
-			inQuote = !inQuote
-			cur.WriteRune(r)
-		case r == ',' && !inQuote:
-			parts = append(parts, cur.String())
-			cur.Reset()
-		default:
-			cur.WriteRune(r)
-		}
-	}
-	return append(parts, cur.String())
-}
-
-// cleanPath 规范化用户粘贴的路径。
-//
-// Windows 资源管理器的"复制文件/文件夹地址"得到的是带双引号的形式
-// （"D:\Games\My Game"），直接粘贴会连引号一起进入程序。双引号在 Windows 路径中
-// 本身非法，因此可以安全剥掉；同时去掉粘贴常见的首尾空白。
-func cleanPath(s string) string {
-	s = strings.TrimSpace(s)
-	for len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		s = strings.TrimSpace(s[1 : len(s)-1])
-	}
-	return s
 }
 
 func main() {
@@ -89,7 +40,7 @@ func main() {
 
 	// 若自身被追加了补丁数据，则直接作为升级器运行（兜底）。
 	if patcher.HasEmbeddedPatch(selfPath) {
-		if err := patcher.RunEmbedded(selfPath); err != nil {
+		if err := patcher.RunEmbedded(selfPath, patcher.RunOptions{}); err != nil {
 			fmt.Printf("\n❌ %v\n", err)
 			patcher.Pause()
 			os.Exit(1)
@@ -126,15 +77,15 @@ func main() {
 		if *output == "" {
 			*output = "game-updater.exe"
 		}
-		absOld, err := filepath.Abs(cleanPath(*oldPath))
+		absOld, err := filepath.Abs(cliutil.CleanPath(*oldPath))
 		if err != nil {
 			patcher.Fatal("❌ 旧版本路径无效: %v", err)
 		}
-		absNew, err := filepath.Abs(cleanPath(*newPath))
+		absNew, err := filepath.Abs(cliutil.CleanPath(*newPath))
 		if err != nil {
 			patcher.Fatal("❌ 新版本路径无效: %v", err)
 		}
-		absOut, err := filepath.Abs(cleanPath(*output))
+		absOut, err := filepath.Abs(cliutil.CleanPath(*output))
 		if err != nil {
 			patcher.Fatal("❌ 输出路径无效: %v", err)
 		}
@@ -142,11 +93,11 @@ func main() {
 		if err != nil {
 			patcher.Fatal("❌ %v", err)
 		}
-		upgraderPath := findBinary(selfPath, *upgraderFlag, upgraderCandidates)
+		upgraderPath := cliutil.FindBinary(selfPath, *upgraderFlag, cliutil.UpgraderCandidates)
 		if upgraderPath == "" {
 			patcher.Fatal("❌ 找不到升级工具基础程序 (upgrader)，请使用 -upgrader 指定路径")
 		}
-		restorerPath := findBinary(selfPath, *restorerFlag, restorerCandidates)
+		restorerPath := cliutil.FindBinary(selfPath, *restorerFlag, cliutil.RestorerCandidates)
 		adapterOpts, err := buildAdapterOptions(*adapterFlag, *godotKey)
 		if err != nil {
 			patcher.Fatal("❌ %v", err)
@@ -178,7 +129,7 @@ func main() {
 func resolvePrevPatches(in []string) ([]string, error) {
 	out := make([]string, 0, len(in))
 	for _, p := range in {
-		p = cleanPath(p)
+		p = cliutil.CleanPath(p)
 		abs, err := filepath.Abs(p)
 		if err != nil {
 			return nil, fmt.Errorf("旧补丁路径无效 %s: %w", p, err)
@@ -200,27 +151,6 @@ func resolvePrevPatches(in []string) ([]string, error) {
 // 非终端（管道 / CI / 重定向）返回 false，继续按脚本方式打印用法。
 func launchedByDoubleClick(shellFlag bool, flagCount, argCount int, stdinIsTTY bool) bool {
 	return !shellFlag && flagCount == 0 && argCount == 0 && stdinIsTTY
-}
-
-// findBinary 查找二进制：优先用户指定，否则在 CLI 同目录按候选名查找。
-func findBinary(selfPath, userSpecified string, candidates []string) string {
-	userSpecified = cleanPath(userSpecified)
-	if userSpecified != "" {
-		if _, err := os.Stat(userSpecified); err != nil {
-			fmt.Printf("⚠️  指定的文件不存在: %s\n", userSpecified)
-			return ""
-		}
-		abs, _ := filepath.Abs(userSpecified)
-		return abs
-	}
-	selfDir := filepath.Dir(selfPath)
-	for _, name := range candidates {
-		candidate := filepath.Join(selfDir, name)
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate
-		}
-	}
-	return ""
 }
 
 func runInteractive(selfPath string) error {
@@ -304,11 +234,11 @@ func runInteractiveWithConfig(selfPath string, cfg interactiveConfig) error {
 		return err
 	}
 
-	upgraderPath := findBinary(selfPath, "", upgraderCandidates)
+	upgraderPath := cliutil.FindBinary(selfPath, "", cliutil.UpgraderCandidates)
 	if upgraderPath == "" {
 		return errors.New("找不到升级工具基础程序 (upgrader)，请将其放在 CLI 同目录下")
 	}
-	restorerPath := findBinary(selfPath, "", restorerCandidates)
+	restorerPath := cliutil.FindBinary(selfPath, "", cliutil.RestorerCandidates)
 
 	fmt.Println()
 	fmt.Printf("  旧版本: %s\n", cfg.OldPath)
@@ -347,7 +277,7 @@ func promptPrevPatches(r *bufio.Reader) ([]string, error) {
 	for {
 		fmt.Print("🔗 要附加的旧版本补丁路径（直接回车结束，可多次输入）: ")
 		line, err := r.ReadString('\n')
-		line = cleanPath(line)
+		line = cliutil.CleanPath(line)
 		if line == "" {
 			if err != nil {
 				return out, nil
@@ -373,7 +303,7 @@ func promptPath(r *bufio.Reader, title string) (string, error) {
 	for {
 		fmt.Printf("📂 %s: ", title)
 		line, err := r.ReadString('\n')
-		line = cleanPath(line)
+		line = cliutil.CleanPath(line)
 		if line == "" {
 			if err != nil {
 				return "", fmt.Errorf("输入已结束，未获取到%s", title)
@@ -398,7 +328,7 @@ func promptOutput(r *bufio.Reader, selfPath string) string {
 	for {
 		fmt.Printf("💾 输出文件路径（回车默认 [%s]）: ", defaultOut)
 		line, err := r.ReadString('\n')
-		line = cleanPath(line)
+		line = cliutil.CleanPath(line)
 		if line == "" {
 			return defaultOut
 		}
@@ -469,7 +399,7 @@ func buildAdapterOptions(adapterName, godotKey string) (adapter.Options, error) 
 		return opts, fmt.Errorf("未知适配器 %q；可用值: none 或已注册适配器名称", adapterName)
 	}
 	opts.Values[adapter.OptionSelected] = adapterName
-	godotKey = cleanPath(godotKey)
+	godotKey = cliutil.CleanPath(godotKey)
 	if godotKey == "" {
 		return opts, nil
 	}
@@ -519,5 +449,5 @@ func promptGodotKey(r *bufio.Reader) (string, error) {
 	if err != nil && line == "" {
 		return "", nil
 	}
-	return cleanPath(line), nil
+	return cliutil.CleanPath(line), nil
 }

@@ -6,12 +6,13 @@ import (
 	"io"
 )
 
-// GPBIN4 是链式补丁制品格式。信封布局：
+// GPBIN4 是补丁制品格式。信封布局：
 //
 //	"GPBIN4"       6B   魔数
-//	formatVersion  u8   (= 5)
+//	formatVersion  u8   (= 7)
 //	payloadKind    u8   差异后端类型
-//	patchVersion   u32  自动递增的补丁版本号
+//	flags          u8   语义标记位
+//	patchVersion   u32  普通补丁自动递增的版本号；合并补丁为 0
 //	payload        ...  由 payloadKind 决定
 //
 // 可执行文件尾部布局：
@@ -24,14 +25,12 @@ const (
 
 	// formatVersion 是补丁制品的线格式版本。
 	//   5 起版本链不再携带版本名称（Label）；
-	//   6 起 Entry 增加适配器名字段（逻辑内容重写），旧版 v5 仍可读取。
-	formatVersion = 6
+	//   6 起 Entry 增加适配器名字段（逻辑内容重写）；
+	//   7 起信封增加 flags，并支持合并补丁（GPBIN4 只接受当前版本）。
+	formatVersion = 7
 
-	// prevFormatVersion 是仍可读的上一个线格式版本（无适配器名字段）。
-	prevFormatVersion = 5
-
-	// legacyFormatVersion 是仍携带版本名称的旧线格式，仅用于给出明确的迁移提示。
-	legacyFormatVersion = 4
+	// bundleVersion 是合并补丁载荷的线格式版本。
+	bundleVersion = 1
 )
 
 // Action 描述一个条目要执行的变更。
@@ -109,18 +108,43 @@ type Entry struct {
 
 // EncodeRelease 将一份补丁制品写入 w。
 func EncodeRelease(w io.Writer, rel *Release) error {
-	if rel == nil || rel.Payload == nil {
-		return fmt.Errorf("补丁内容为空")
+	if err := checkReleasePayloads(rel); err != nil {
+		return err
+	}
+	if rel.Flags&^flagKnownMask != 0 {
+		return fmt.Errorf("补丁标记位含未知位: %#x", uint8(rel.Flags))
 	}
 	e := &encWriter{w: w}
 	e.raw([]byte(patchMagic))
 	e.u8(formatVersion)
-	e.u8(byte(rel.Payload.Kind()))
+	if rel.Payload != nil {
+		e.u8(byte(PayloadChunk))
+	} else {
+		e.u8(byte(PayloadBundle))
+	}
+	e.u8(byte(rel.Flags))
 	e.u32(rel.PatchVersion)
 	if e.err != nil {
 		return e.err
 	}
-	return rel.Payload.Encode(w)
+	if rel.Payload != nil {
+		return rel.Payload.Encode(w)
+	}
+	return rel.Bundle.Encode(w)
+}
+
+// checkReleasePayloads 确保两种载荷互斥且必有一非空。
+func checkReleasePayloads(rel *Release) error {
+	if rel == nil {
+		return fmt.Errorf("补丁内容为空")
+	}
+	switch {
+	case rel.Payload != nil && rel.Bundle != nil:
+		return fmt.Errorf("补丁同时携带普通载荷与合并载荷")
+	case rel.Payload == nil && rel.Bundle == nil:
+		return fmt.Errorf("补丁内容为空")
+	}
+	return nil
 }
 
 // DecodeRelease 解析补丁制品字节流。所有长度字段都经过边界校验，
@@ -138,25 +162,31 @@ func DecodeRelease(data []byte) (*Release, error) {
 	if err != nil {
 		return nil, err
 	}
-	if ver == legacyFormatVersion {
-		return nil, fmt.Errorf("该补丁使用已淘汰的旧格式（v%d），请用当前版本的 CLI 重新生成补丁", ver)
-	}
-	if ver != formatVersion && ver != prevFormatVersion {
-		return nil, fmt.Errorf("不支持的补丁格式版本: %d", ver)
+	if ver != formatVersion {
+		return nil, fmt.Errorf("不支持的补丁格式版本: %d（当前仅支持 v%d，请用当前版本的 CLI 重新生成补丁）", ver, formatVersion)
 	}
 	kind, err := d.u8()
 	if err != nil {
 		return nil, err
+	}
+	flags, err := d.u8()
+	if err != nil {
+		return nil, err
+	}
+	if Flags(flags)&^flagKnownMask != 0 {
+		return nil, fmt.Errorf("补丁标记位含未知位: %#x", flags)
 	}
 	patchVersion, err := d.u32()
 	if err != nil {
 		return nil, fmt.Errorf("补丁版本号: %w", err)
 	}
 
-	var payload *ChunkPayload
+	rel := &Release{PatchVersion: patchVersion, Flags: Flags(flags)}
 	switch PayloadKind(kind) {
 	case PayloadChunk:
-		payload, err = decodeChunkPayload(d, int(ver))
+		rel.Payload, err = decodeChunkPayload(d)
+	case PayloadBundle:
+		rel.Bundle, err = decodeBundlePayload(d)
 	default:
 		return nil, fmt.Errorf("不支持的差异后端类型: %d", kind)
 	}
@@ -166,7 +196,7 @@ func DecodeRelease(data []byte) (*Release, error) {
 	if d.remaining() != 0 {
 		return nil, fmt.Errorf("补丁数据尾部存在 %d 字节多余内容", d.remaining())
 	}
-	return &Release{PatchVersion: patchVersion, Payload: payload}, nil
+	return rel, nil
 }
 
 func encodeEntry(e *encWriter, en *Entry) {
@@ -235,7 +265,7 @@ func encodeOp(e *encWriter, op *DeltaOp) {
 	}
 }
 
-func decodeEntry(d *decoder, ver int) (Entry, error) {
+func decodeEntry(d *decoder) (Entry, error) {
 	var en Entry
 	path, err := d.str()
 	if err != nil {
@@ -245,31 +275,29 @@ func decodeEntry(d *decoder, ver int) (Entry, error) {
 		return en, fmt.Errorf("路径非法: %w", err)
 	}
 	en.Path = path
-	if ver >= 6 {
-		name, err := d.str()
+	name, err := d.str()
+	if err != nil {
+		return en, fmt.Errorf("适配器名: %w", err)
+	}
+	if name != "" {
+		if err := validateAdapterName(name); err != nil {
+			return en, fmt.Errorf("适配器名非法: %w", err)
+		}
+	}
+	en.Adapter = name
+	if name != "" {
+		n, err := d.u32()
 		if err != nil {
-			return en, fmt.Errorf("适配器名: %w", err)
+			return en, fmt.Errorf("适配器参数: %w", err)
 		}
-		if name != "" {
-			if err := validateAdapterName(name); err != nil {
-				return en, fmt.Errorf("适配器名非法: %w", err)
-			}
+		if uint64(n) > uint64(d.remaining()) {
+			return en, fmt.Errorf("适配器参数越界: %d（剩余 %d）", n, d.remaining())
 		}
-		en.Adapter = name
-		if name != "" {
-			n, err := d.u32()
-			if err != nil {
-				return en, fmt.Errorf("适配器参数: %w", err)
-			}
-			if uint64(n) > uint64(d.remaining()) {
-				return en, fmt.Errorf("适配器参数越界: %d（剩余 %d）", n, d.remaining())
-			}
-			meta, err := d.raw(int(n))
-			if err != nil {
-				return en, err
-			}
-			en.AdapterMeta = append([]byte(nil), meta...)
+		meta, err := d.raw(int(n))
+		if err != nil {
+			return en, err
 		}
+		en.AdapterMeta = append([]byte(nil), meta...)
 	}
 	action, err := d.u8()
 	if err != nil {

@@ -15,6 +15,7 @@
 - **原子写入** — 临时文件重建 + 哈希校验通过后才替换目标
 - **自动备份与回滚** — 备份旧文件并附带恢复工具，失败时尽力自动回滚
 - **安全解析** — 补丁格式全字段边界校验，路径穿越防护
+- **跨游戏补丁合并** — 独立 merge 工具可把多款游戏的单段补丁合并为一个升级器，运行时自动识别目标游戏
 
 ## 实测效果
 
@@ -235,6 +236,56 @@ restorer.exe
 - `add` → 删除升级时新增的文件；
 - `update` / `delete` → 从备份恢复，并校验恢复后的 BLAKE3 与升级前一致。
 
+## 跨游戏补丁合并（merge 工具）
+
+`game-patcher-merge` 把**多款游戏**的单段补丁合并成一个升级器。运行时它会自动识别当前目录属于哪个目标游戏，只应用匹配的那一份，其他目标的文件一律不动。
+
+### 前提约束
+
+- 参与合并的补丁必须是**不带版本链**的单段补丁 —— 即生成时**没有**使用 `-prev`；
+- 合并出来的补丁**不能**再作为 `-prev` 使用（工具会显式拒绝并提示）。
+
+### 命令模式
+
+```bash
+game-patcher-merge-win64.exe -out ./combined.exe ./fixA.exe ./fixB.exe
+```
+
+常用参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `-out` | 输出路径，默认与 merge 工具同目录的 `game-updater.exe` |
+| `-id <补丁>=<标识>` | 指定游戏标识；缺省回退为输入文件名（去扩展名） |
+| `-label <补丁>=<名称>` | 指定显示名称；缺省与标识相同 |
+| `-upgrader` | 升级工具基础程序；默认同目录自动查找 |
+| `-restorer` | 恢复工具；默认同目录自动查找，找不到则不内嵌 |
+| `-shell` | 进入交互模式 |
+
+### 交互模式
+
+直接双击（无参数、标准输入是终端）或加 `-shell` 即进入**纯文本**问答：依次输入补丁路径（回车结束，至少 2 份）→ 逐个确认游戏标识与显示名称 → 输出路径 → 升级工具/恢复工具 → `y/N` 确认。
+
+无参数但标准输入不是终端（管道 / CI）时，会打印用法并以非零状态退出，不会阻塞。
+
+### 运行时的目标识别
+
+升级器按「补丁触及文件的存在性 + 大小 + BLAKE3」逐个比对各目标：
+
+- 命中 1 个 → 应用该目标；
+- 命中 0 个 → 列出每个目标的失败原因后中止，不修改任何文件；
+- 命中多个（两款游戏特征完全相同）→ 报「目标歧义」并中止，可用 `-target <游戏标识>` 指定：
+
+```bash
+game-updater.exe -target game-a
+```
+
+判定依据是**文件指纹**，游戏标识只用于展示与消歧 —— 即使标识填错也不会把 A 的补丁打到 B 上，最坏情况是报「无法识别」。
+
+### 体积
+
+各目标的字面量放入**共享块池**并按内容哈希去重，因此合并补丁的体积小于两份独立补丁之和。
+
 ## 二进制补丁格式（GPBIN4）
 
 生成的升级工具是：
@@ -262,7 +313,25 @@ restorer.exe
 └────────────────────────────────────────────┘
 ```
 
-一个版本链由若干段组成，第 i 段表示"版本 i → 版本 i+1"的差异；每段由若干 `Entry` 组成。
+普通补丁（`payloadKind=2`）的一个版本链由若干段组成，第 i 段表示"版本 i → 版本 i+1"的差异；
+每段由若干 `Entry` 组成。
+
+合并补丁（`payloadKind=3`）的载荷为：
+
+```
+bundleVersion u8
+targetCount   uint32 LE
+target[] {
+    gameIDLen uint32 + gameID
+    labelLen  uint32 + label
+    steps     []      每个 target 恰好 1 段（不带版本链）
+}
+chunkCount    uint32 LE  跨目标共享的字面量块数
+Blob[]
+```
+
+`flags` 的 bit0（`IneligibleAsPrev`）表示该补丁不能作为 `-prev`：合并补丁必定置位，
+生成端读取 `-prev` 时会据此显式拒绝（而非误当作单链补丁处理）。
 
 **版本只用链内序号标识（v1、v2、v3…），制品中不记录任何版本名称。** 应用端用于识别版本的
 指纹（各版本下被触及文件的存在性 / 大小 / BLAKE3）由各段的 old/new 哈希回放推导，不占存储。
@@ -271,7 +340,7 @@ restorer.exe
 
 ```
 pathLen uint32 + path
-adapterLen uint32 + adapterName   (formatVersion >= 6；空表示普通字节差分)
+adapterLen uint32 + adapterName   (空表示普通字节差分)
 adapterMetaLen uint32 + adapterMeta  (仅当 adapterName 非空)
 action  uint8 (1=add 2=update 3=delete)
 oldHash [32]byte BLAKE3
@@ -320,6 +389,8 @@ Op[]
 │   ├── model.go      # FileState / VersionRef / Release / Payload 契约
 │   ├── format.go     # GPBIN4 制品信封、边界安全编解码
 │   ├── chain.go      # 版本链段结构与各版本指纹回放推导
+│   ├── bundle.go     # 合并补丁载荷（多目标 + 共享块池）
+│   ├── merge.go      # 合并逻辑：单段校验、标识解析、池去重
 │   ├── chunk.go      # 补丁后端（版本链 + 共享块池）编解码与自检
 │   ├── chunkbuild.go # 块池去重、删除文件块索引与差异构建
 │   ├── detect.go     # 应用端版本自动检测与整体校验
@@ -349,9 +420,10 @@ go test ./...          # 含 test/app.asar(.orig) 的真实集成与端到端 EX
 
 ## 兼容性
 
-- 当前版本使用 `GPBIN4` 链式制品格式（支持多版本），线格式版本 `formatVersion=6`。
-- `formatVersion=6` 起 `Entry` 增加适配器名与适配器参数（逻辑内容重写）；`formatVersion=5` 仍可正常读取。
-- 读到 `formatVersion=4` 的旧制品会被明确拒绝并提示用当前 CLI 重新生成（旧版会写入版本名称字段）。
+- 当前版本使用 `GPBIN4` 制品格式，线格式版本 `formatVersion=7`（**仅接受 v7**；v6 及更早的补丁需用当前 CLI 重新生成）。
+- `formatVersion=7` 起信封新增 `flags` 标记位，并支持合并补丁（`payloadKind=3`）。
+- `formatVersion=7` 起 `Entry` 固定包含适配器名与适配器参数（逻辑内容重写）；v5/v6 的读取分支已随本次破坏性变更移除。
+- 合并补丁（由 `game-patcher-merge` 产出）不能作为 `-prev`；尝试传入会被显式拒绝。
 - **不兼容** `GPBIN3` / `GPBIN2` 生成的旧补丁（已发布的旧 EXE 自带旧代码不受影响，但新 CLI 无法把旧补丁作为 `-prev` 读取）；`GAMEPATCH1` 同样不再支持。
 - 仅支持目录模式：`-old` / `-new` 必须是目录。
 - `restore.json` 与恢复工具的契约保持不变：`add` = 删除新增文件，`update`/`delete` = 从备份还原。

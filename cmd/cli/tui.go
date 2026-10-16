@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"game-patcher/adapter"
+	"game-patcher/internal/cliutil"
 	"game-patcher/patcher"
 )
 
@@ -297,7 +298,7 @@ func (m wizardModel) submit() (wizardModel, tea.Cmd) {
 		m.err = ""
 		m.step = stepPrevPatches
 	case stepPrevPatches:
-		raw := cleanPath(m.prevInput.Value())
+		raw := cliutil.CleanPath(m.prevInput.Value())
 		if raw == "" {
 			m.err = ""
 			m.step = stepAdapter
@@ -397,7 +398,7 @@ func (m wizardModel) config() interactiveConfig {
 }
 
 func resolveWizardDir(raw, label string) (string, error) {
-	raw = cleanPath(raw)
+	raw = cliutil.CleanPath(raw)
 	if raw == "" {
 		return "", fmt.Errorf("%s文件夹不能为空", label)
 	}
@@ -419,7 +420,7 @@ func resolveWizardDir(raw, label string) (string, error) {
 }
 
 func resolveWizardFile(raw, label string) (string, error) {
-	raw = cleanPath(raw)
+	raw = cliutil.CleanPath(raw)
 	if raw == "" {
 		return "", fmt.Errorf("%s路径不能为空", label)
 	}
@@ -442,7 +443,7 @@ func resolveWizardFile(raw, label string) (string, error) {
 
 func resolveWizardOutput(raw, selfPath string) (string, error) {
 	defaultOut := filepath.Join(filepath.Dir(selfPath), "game-updater.exe")
-	raw = cleanPath(raw)
+	raw = cliutil.CleanPath(raw)
 	if raw == "" {
 		return defaultOut, nil
 	}
@@ -457,7 +458,7 @@ func resolveWizardOutput(raw, selfPath string) (string, error) {
 }
 
 func resolveWizardGodotKey(raw string) (string, error) {
-	raw = cleanPath(raw)
+	raw = cliutil.CleanPath(raw)
 	if raw == "" {
 		return "", nil
 	}

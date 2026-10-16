@@ -21,11 +21,24 @@ type VersionRef struct {
 type PayloadKind uint8
 
 const (
-	// PayloadChunk 是补丁唯一的差异数据格式：版本链 + 共享字面量池 + 跨文件块复用。
-	//
-	// 共享块池与跨文件复用的实现依赖 chunk.SelfCheck 中校验的 Pool 与 OpCopyFrom
-	// 约束，因此 payloadKind 保留了它的值空间。
+	// PayloadChunk 是普通补丁的差异数据格式：单条版本链 + 共享字面量池 + 跨文件块复用。
 	PayloadChunk PayloadKind = 2
+
+	// PayloadBundle 是合并补丁的差异数据格式：多个互不相干的单段目标 + 共享字面量池。
+	// 合并补丁不携带版本链，也不能作为 -prev 使用（见 Flags）。
+	PayloadBundle PayloadKind = 3
+)
+
+// Flags 是补丁信封的语义标记位。
+type Flags uint8
+
+const (
+	// FlagIneligibleAsPrev 标记该补丁不能作为 -prev 参与版本链拼接。
+	// 合并补丁必须置位，构建端据此显式拒绝。
+	FlagIneligibleAsPrev Flags = 1 << 0
+
+	// flagKnownMask 是当前已定义的标记位集合；出现未知位说明制品来自更新的版本或已损坏。
+	flagKnownMask = FlagIneligibleAsPrev
 )
 
 // Blob 是共享字面量池中的一个数据块。
@@ -43,8 +56,14 @@ type Stage struct {
 	Pool        []Blob // 本段可引用的共享字面量池
 }
 
-// Release 是一份补丁制品：制品信封 + 版本链差异数据。
+// Release 是一份补丁制品：制品信封 + 差异数据。
+//
+// 两种差异数据互斥且必有一非空：
+//   - Payload：普通补丁的单条版本链；
+//   - Bundle： 合并补丁的多个独立目标。
 type Release struct {
-	PatchVersion uint32        // 自动递增的补丁版本号
-	Payload      *ChunkPayload // 补丁差异数据
+	PatchVersion uint32        // 普通补丁自动递增的版本号；合并补丁恒为 0
+	Flags        Flags         // 信封标记位
+	Payload      *ChunkPayload // 普通补丁载荷
+	Bundle       *BundlePayload
 }

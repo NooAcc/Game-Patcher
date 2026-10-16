@@ -3,6 +3,7 @@ package patcher
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -136,6 +137,15 @@ func loadPrevRelease(paths []string) (*Release, error) {
 		rel, err := readEmbeddedRelease(p)
 		if err != nil {
 			return nil, fmt.Errorf("读取旧补丁 %s 失败: %w", p, err)
+		}
+		// 约束 C2：合并补丁不带版本链，无法参与 -prev 拼接，必须显式拒绝。
+		// 这里必须先于任何 rel.Payload 解引用，否则会 panic。
+		if rel.Bundle != nil || rel.Flags&FlagIneligibleAsPrev != 0 {
+			return nil, fmt.Errorf("补丁 %s 是合并补丁，不能作为 -prev 使用；请使用未经过 merge 的原始补丁",
+				filepath.Base(p))
+		}
+		if rel.Payload == nil {
+			return nil, fmt.Errorf("旧补丁 %s 内容为空", filepath.Base(p))
 		}
 		rels = append(rels, rel)
 	}

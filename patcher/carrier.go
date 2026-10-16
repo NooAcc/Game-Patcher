@@ -250,3 +250,12 @@ func restorerFileName() string {
 	}
 	return "restorer"
 }
+// ReadPatchFile 读取补丁可执行文件中的制品，供 merge 等外部工具使用。
+func ReadPatchFile(exePath string) (*Release, error) {
+	return readEmbeddedRelease(exePath)
+}
+
+// WritePatchExecutable 把基础程序与补丁制品拼装成单个可执行文件。
+func WritePatchExecutable(baseExe string, rel *Release, outputPath, restorerPath string) error {
+	return writePatchExecutable(baseExe, rel, outputPath, restorerPath)
+}

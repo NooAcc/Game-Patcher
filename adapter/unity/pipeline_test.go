@@ -86,7 +86,7 @@ func TestEndToEndRewritePipeline(t *testing.T) {
 		devNull.Close()
 	}()
 
-	if err := patcher.RunEmbedded(updaterInGame); err != nil {
+	if err := patcher.RunEmbedded(updaterInGame, patcher.RunOptions{}); err != nil {
 		t.Fatalf("RunEmbedded: %v", err)
 	}
 

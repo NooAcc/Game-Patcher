@@ -7,7 +7,7 @@ import (
 
 const minChunkEncodedSize = 1 + 32 + 8 + 8 // comp + rawHash + rawLen + dataLen
 
-// ChunkPayload 是补丁的差异数据：版本链 + 共享字面量池 + 跨文件块复用。
+// ChunkPayload 是普通补丁的差异数据：版本链 + 共享字面量池 + 跨文件块复用。
 //
 //   - 版本链决定"能从哪些版本升级到目标版本"，并由各段回放推导出检测指纹；
 //   - 所有段的字面量统一放进去重的 Pool，条目以 OpPoolRef 引用；
@@ -63,21 +63,8 @@ func (c *ChunkPayload) SelfCheck() error {
 	for i := range c.Steps {
 		for j := range c.Steps[i].Entries {
 			en := &c.Steps[i].Entries[j]
-			for k := range en.Ops {
-				op := &en.Ops[k]
-				switch op.Kind {
-				case OpPoolRef:
-					if int(op.PoolIndex) >= len(c.Pool) {
-						return fmt.Errorf("第 %d 段条目 %s 的块池引用越界: %d（池大小 %d）", i+1, en.Path, op.PoolIndex, len(c.Pool))
-					}
-					if c.Pool[op.PoolIndex].RawLen != op.Length {
-						return fmt.Errorf("第 %d 段条目 %s 的块池引用长度不匹配", i+1, en.Path)
-					}
-				case OpCopyFrom:
-					if err := validateRelPath(op.SrcPath); err != nil {
-						return fmt.Errorf("第 %d 段条目 %s 的跨文件源非法: %w", i+1, en.Path, err)
-					}
-				}
+			if err := checkEntryPoolRefs(en, len(c.Pool)); err != nil {
+				return fmt.Errorf("第 %d 段条目 %s: %w", i+1, en.Path, err)
 			}
 		}
 	}
@@ -90,12 +77,18 @@ func (c *ChunkPayload) Encode(w io.Writer) error {
 	}
 	e := &encWriter{w: w}
 	encodeSteps(e, c.Steps)
-	e.u32(uint32(len(c.Pool)))
-	for i := range c.Pool {
-		b := &c.Pool[i]
+	encodeBlobs(e, c.Pool)
+	return e.err
+}
+
+// encodeBlobs 写出共享字面量池。
+func encodeBlobs(e *encWriter, pool []Blob) {
+	e.u32(uint32(len(pool)))
+	for i := range pool {
+		b := &pool[i]
 		if b.Comp != CompRaw && b.Comp != CompFlate {
 			e.fail(fmt.Errorf("块池第 %d 项压缩方式非法: %d", i, b.Comp))
-			return e.err
+			return
 		}
 		e.u8(byte(b.Comp))
 		e.raw(b.Hash[:])
@@ -103,15 +96,26 @@ func (c *ChunkPayload) Encode(w io.Writer) error {
 		e.u64(uint64(len(b.Data)))
 		e.raw(b.Data)
 	}
-	return e.err
 }
 
-func decodeChunkPayload(d *decoder, ver int) (*ChunkPayload, error) {
-	steps, err := decodeSteps(d, ver)
+func decodeChunkPayload(d *decoder) (*ChunkPayload, error) {
+	steps, err := decodeSteps(d)
 	if err != nil {
 		return nil, err
 	}
+	pool, err := decodeBlobs(d)
+	if err != nil {
+		return nil, err
+	}
+	cp := &ChunkPayload{Steps: steps, Pool: pool}
+	if err := cp.SelfCheck(); err != nil {
+		return nil, err
+	}
+	return cp, nil
+}
 
+// decodeBlobs 读入共享字面量池。
+func decodeBlobs(d *decoder) ([]Blob, error) {
 	count, err := d.u32()
 	if err != nil {
 		return nil, err
@@ -149,10 +153,5 @@ func decodeChunkPayload(d *decoder, ver int) (*ChunkPayload, error) {
 		}
 		pool = append(pool, Blob{Hash: rawHash, Comp: CompMethod(comp), RawLen: rawLen, Data: data})
 	}
-
-	cp := &ChunkPayload{Steps: steps, Pool: pool}
-	if err := cp.SelfCheck(); err != nil {
-		return nil, err
-	}
-	return cp, nil
+	return pool, nil
 }

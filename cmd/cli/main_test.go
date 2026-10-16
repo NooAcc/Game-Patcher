@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"game-patcher/internal/cliutil"
 	"time"
 
 	"game-patcher/adapter"
@@ -154,14 +156,14 @@ func TestCleanPath(t *testing.T) {
 		{"\"a\"b\"", "a\"b"},
 	}
 	for _, c := range cases {
-		if got := cleanPath(c.in); got != c.want {
-			t.Fatalf("cleanPath(%q) = %q，期望 %q", c.in, got, c.want)
+		if got := cliutil.CleanPath(c.in); got != c.want {
+			t.Fatalf("cliutil.CleanPath(%q) = %q，期望 %q", c.in, got, c.want)
 		}
 	}
 }
 
 func TestSplitPathListIgnoresCommasInsideQuotes(t *testing.T) {
-	got := splitPathList("\"D:/Games, Inc/v1.exe\",E:/v2.exe")
+	got := cliutil.SplitPathList("\"D:/Games, Inc/v1.exe\",E:/v2.exe")
 	want := []string{"\"D:/Games, Inc/v1.exe\"", "E:/v2.exe"}
 	if len(got) != len(want) {
 		t.Fatalf("splitPathList = %q，期望 %q", got, want)

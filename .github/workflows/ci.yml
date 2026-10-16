@@ -47,15 +47,17 @@ jobs:
           $exes = @(
             "build/game-patcher-cli-win64.exe"
             "build/game-patcher-upgrader-win64.exe"
+            "build/game-patcher-merge-win64.exe"
             "build/restorer-win64.exe"
           )
 
           New-Item -ItemType Directory -Path build -Force | Out-Null
           go build -ldflags="-s -w" -o build/game-patcher-cli-win64.exe ./cmd/cli/
           go build -ldflags="-s -w" -o build/game-patcher-upgrader-win64.exe ./cmd/upgrader/
+          go build -ldflags="-s -w" -o build/game-patcher-merge-win64.exe ./cmd/merge/
           go build -ldflags="-s -w" -o build/restorer-win64.exe ./cmd/restorer/
 
-          # 三个 exe 打包为单个 zip，zip 内不含目录层级
+          # 四个 exe 打包为单个 zip，zip 内不含目录层级
           Compress-Archive -Path $exes -DestinationPath $zip -CompressionLevel Optimal
 
           Get-ChildItem $zip | ForEach-Object {

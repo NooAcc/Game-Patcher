@@ -92,7 +92,7 @@ func encodeSteps(e *encWriter, steps []ChainStep) {
 }
 
 // decodeSteps 读入段列表。
-func decodeSteps(d *decoder, ver int) ([]ChainStep, error) {
+func decodeSteps(d *decoder) ([]ChainStep, error) {
 	stepCount, err := d.u32()
 	if err != nil {
 		return nil, err
@@ -115,7 +115,7 @@ func decodeSteps(d *decoder, ver int) ([]ChainStep, error) {
 		}
 		st := ChainStep{SourceIndex: srcIndex, Entries: make([]Entry, 0, entryCount)}
 		for j := uint32(0); j < entryCount; j++ {
-			en, err := decodeEntry(d, ver)
+			en, err := decodeEntry(d)
 			if err != nil {
 				return nil, fmt.Errorf("第 %d 段条目 %d: %w", i+1, j, err)
 			}

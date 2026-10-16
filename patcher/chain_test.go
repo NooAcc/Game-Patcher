@@ -338,19 +338,21 @@ func TestChainEncodeDecodePreservesMultipleSteps(t *testing.T) {
 	}
 }
 
-// 旧线格式（版本链仍携带版本名称）必须被明确拒绝，并提示重新生成。
+// v7 之前的旧线格式必须被明确拒绝，并提示用当前 CLI 重新生成。
 func TestDecodeRejectsLegacyFormatVersion(t *testing.T) {
-	var b bytes.Buffer
-	b.WriteString(patchMagic)
-	b.WriteByte(byte(legacyFormatVersion))
-	b.WriteByte(byte(PayloadChunk))
-	b.Write([]byte{0, 0, 0, 0}) // patchVersion
+	for _, oldVer := range []byte{4, 5, 6} {
+		var b bytes.Buffer
+		b.WriteString(patchMagic)
+		b.WriteByte(oldVer)
+		b.WriteByte(byte(PayloadChunk))
+		b.Write([]byte{0, 0, 0, 0}) // patchVersion
 
-	_, err := DecodeRelease(b.Bytes())
-	if err == nil {
-		t.Fatal("旧线格式应被拒绝")
-	}
-	if !strings.Contains(err.Error(), "旧格式") {
-		t.Fatalf("错误提示应说明是旧格式: %v", err)
+		_, err := DecodeRelease(b.Bytes())
+		if err == nil {
+			t.Fatalf("旧线格式 v%d 应被拒绝", oldVer)
+		}
+		if !strings.Contains(err.Error(), "重新生成") {
+			t.Fatalf("v%d 的错误提示应引导重新生成: %v", oldVer, err)
+		}
 	}
 }
