@@ -125,7 +125,7 @@ func TestBundleSelfCheckRejectsInvalid(t *testing.T) {
 			{GameID: "DUP", Steps: []ChainStep{{SourceIndex: 1, Entries: []Entry{{Path: "y", Action: ActionDelete}}}}},
 		}}},
 		{"游戏标识非法字符", &BundlePayload{Targets: []BundleTarget{
-			{GameID: "bad id!", Steps: []ChainStep{{SourceIndex: 1, Entries: []Entry{{Path: "x", Action: ActionDelete}}}}},
+			{GameID: "bad/id", Steps: []ChainStep{{SourceIndex: 1, Entries: []Entry{{Path: "x", Action: ActionDelete}}}}},
 		}}},
 		{"块池引用越界", &BundlePayload{Targets: []BundleTarget{
 			{GameID: "a", Steps: []ChainStep{{SourceIndex: 1, Entries: []Entry{{

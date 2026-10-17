@@ -66,24 +66,24 @@ func makeSingleStepPatch(t *testing.T, dir, name, oldContent, newContent string)
 	return out
 }
 
-func TestCommandConfigParsesIDsAndOutput(t *testing.T) {
+func TestCommandConfigParsesNameAndOutput(t *testing.T) {
 	self := filepath.Join(tempWorkDir(t), "merge.exe")
 	inputA := filepath.Join(tempWorkDir(t), "a.exe")
 	inputB := filepath.Join(tempWorkDir(t), "b.exe")
 
 	cfg, err := commandConfig(self, []string{inputA, inputB}, "out.exe", "", "",
-		stringList{inputA + "=game-a"}, stringList{inputA + "=游戏A"})
+		stringList{inputA + "=游戏 A"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(cfg.Inputs) != 2 {
 		t.Fatalf("输入数量 = %d，期望 2", len(cfg.Inputs))
 	}
-	if cfg.IDs[inputA] != "game-a" {
-		t.Fatalf("-id 未生效: %+v", cfg.IDs)
+	if cfg.IDs[inputA] != "游戏 A" {
+		t.Fatalf("-name 未写入 ID: %+v", cfg.IDs)
 	}
-	if cfg.Labels[inputA] != "游戏A" {
-		t.Fatalf("-label 未生效: %+v", cfg.Labels)
+	if cfg.Labels[inputA] != "游戏 A" {
+		t.Fatalf("-name 未写入 Label: %+v", cfg.Labels)
 	}
 	if cfg.Output != filepath.Join(filepath.Dir(self), "out.exe") && filepath.Base(cfg.Output) != "out.exe" {
 		t.Fatalf("输出路径不正确: %s", cfg.Output)
@@ -92,31 +92,29 @@ func TestCommandConfigParsesIDsAndOutput(t *testing.T) {
 
 func TestCommandConfigRejectsBadIDFormat(t *testing.T) {
 	self := filepath.Join(tempWorkDir(t), "merge.exe")
-	if _, err := commandConfig(self, []string{"a.exe", "b.exe"}, "", "", "", stringList{"no-equals"}, nil); err == nil {
-		t.Fatal("-id 缺少 '=' 应报错")
+	if _, err := commandConfig(self, []string{"a.exe", "b.exe"}, "", "", "", stringList{"no-equals"}); err == nil {
+		t.Fatal("-name 缺少 '=' 应报错")
 	}
 }
 
-// TestInteractiveConfigScriptedInput 覆盖 AC9：脚本化输入走完交互流程。
+// TestInteractiveConfigScriptedInput 覆盖简化后的交互流程：
+// 输入补丁路径、可选游戏标识、输出路径、默认确认。
 func TestInteractiveConfigScriptedInput(t *testing.T) {
 	dir := tempWorkDir(t)
 	patchA := makeSingleStepPatch(t, dir, "a", "a1", "a2")
 	patchB := makeSingleStepPatch(t, dir, "b", "b1", "b2")
-	base := writeFakeBaseExe(t, dir)
 
 	out := filepath.Join(dir, "combined.exe")
-	// 问答顺序: 输入A、输入B、结束输入、A 的标识/名称、B 的标识/名称、
-	//          输出路径、升级工具、恢复工具(- 表示不内嵌)、确认
+	// 问答顺序: 输入A、输入B、结束输入、A 的游戏标识、B 留空使用文件名、
+	//          输出路径、空行确认(Y)。
 	script := strings.Join([]string{
 		patchA,
 		patchB,
 		"",
-		"game-a", "游戏A",
-		"game-b", "游戏B",
+		"game-a",
+		"",
 		out,
-		base,
-		"-",
-		"y",
+		"",
 	}, "\n")
 
 	r := bufio.NewReader(strings.NewReader(script))
@@ -127,16 +125,20 @@ func TestInteractiveConfigScriptedInput(t *testing.T) {
 	if len(cfg.Inputs) != 2 {
 		t.Fatalf("输入数量 = %d，期望 2", len(cfg.Inputs))
 	}
-	if cfg.IDs[patchA] != "game-a" || cfg.Labels[patchB] != "游戏B" {
-		t.Fatalf("交互输入未生效: %+v / %+v", cfg.IDs, cfg.Labels)
+	if cfg.IDs[patchA] != "game-a" || cfg.Labels[patchA] != "game-a" {
+		t.Fatalf("自定义游戏标识未同时写入 ID/Label: %+v / %+v", cfg.IDs, cfg.Labels)
+	}
+	if cfg.IDs[patchB] != "b" || cfg.Labels[patchB] != "b" {
+		t.Fatalf("留空时应默认使用文件名: %+v / %+v", cfg.IDs, cfg.Labels)
 	}
 	if cfg.Output != out {
 		t.Fatalf("输出 = %s，期望 %s", cfg.Output, out)
 	}
-	if cfg.Restorer != "" {
-		t.Fatalf("输入 '-' 应表示不内嵌恢复工具")
+	if filepath.Base(cfg.Upgrader) != "upgrader.exe" {
+		t.Fatalf("交互模式应自动查找同目录升级工具，实际 %q", cfg.Upgrader)
+	} else if cfg.Restorer != "" {
+		t.Fatalf("同目录不存在恢复工具时不应要求输入，实际 %q", cfg.Restorer)
 	}
-// 不再需要 buf
 }
 
 // TestInteractiveConfigRequiresTwoInputs 覆盖 AC9 的下限校验。
@@ -153,6 +155,35 @@ func TestInteractiveConfigRequiresTwoInputs(t *testing.T) {
 	}
 }
 
+func TestCollectMergeConfigDefaultsConfirmToYes(t *testing.T) {
+	dir := tempWorkDir(t)
+	patchA := makeSingleStepPatch(t, dir, "a", "a1", "a2")
+	patchB := makeSingleStepPatch(t, dir, "b", "b1", "b2")
+	out := filepath.Join(dir, "combined.exe")
+
+	// 最终确认输入空行，应等价于 Y。
+	script := strings.Join([]string{patchA, patchB, "", "", "", out, ""}, "\n")
+	cfg, err := collectMergeConfigFrom(bufio.NewReader(strings.NewReader(script)), filepath.Join(dir, "merge.exe"))
+	if err != nil {
+		t.Fatalf("空行确认应默认执行合并: %v", err)
+	}
+	if cfg.Output != out {
+		t.Fatalf("输出 = %s，期望 %s", cfg.Output, out)
+	}
+}
+
+func TestCommandConfigNameSupportsChineseAndSpace(t *testing.T) {
+	self := filepath.Join(tempWorkDir(t), "merge.exe")
+	inputA := filepath.Join(tempWorkDir(t), "a.exe")
+	inputB := filepath.Join(tempWorkDir(t), "b.exe")
+	cfg, err := commandConfig(self, []string{inputA, inputB}, "", "", "", stringList{inputA + "=游戏 A"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.IDs[inputA] != "游戏 A" || cfg.Labels[inputA] != "游戏 A" {
+		t.Fatalf("名称应同时写入 ID/Label: %+v / %+v", cfg.IDs, cfg.Labels)
+	}
+}
 // TestExecuteMergesTwoGames 覆盖 AC1 + AC6：合并成功且共享池去重。
 func TestExecuteMergesTwoGames(t *testing.T) {
 	dir := tempWorkDir(t)

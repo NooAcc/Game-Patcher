@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode/utf8"
 )
 
 // BundleTarget 是合并补丁中的一个独立目标：一款游戏的一次状态迁移。
@@ -151,16 +152,22 @@ func checkEntryPoolRefs(en *Entry, poolSize int) error {
 	return nil
 }
 
-// validateGameID 校验游戏标识：仅允许字母、数字、'-'、'_'、'.'，长度 1..64。
+// validateGameID 校验用户可见的游戏标识。
+// 标识同时作为运行时展示名称，因此允许中文、空格等字符；仍禁止控制字符和
+// 路径分隔符，避免影响命令行输出、日志与 Windows 路径习惯。
 func validateGameID(id string) error {
-	if len(id) == 0 || len(id) > 64 {
-		return fmt.Errorf("长度非法: %d", len(id))
+	if id == "" {
+		return fmt.Errorf("长度非法: 0")
+	}
+	if utf8.RuneCountInString(id) > 64 {
+		return fmt.Errorf("长度非法: %d 个字符", utf8.RuneCountInString(id))
 	}
 	for _, r := range id {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
-			r == '-', r == '_', r == '.':
-		default:
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("含控制字符 %q", r)
+		}
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
 			return fmt.Errorf("含非法字符 %q", r)
 		}
 	}

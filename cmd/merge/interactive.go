@@ -57,25 +57,20 @@ func collectMergeConfigFrom(r *bufio.Reader, selfPath string) (mergeConfig, erro
 	}
 
 	fmt.Println()
-	fmt.Println("为每份补丁指定标识与名称（回车接受默认值）。")
+	fmt.Println("为每份补丁输入游戏标识（留空使用文件名）。")
 	for _, path := range cfg.Inputs {
 		defaultID := defaultGameID(path)
-		id, err := promptLine(r, fmt.Sprintf("[%s] 游戏标识（默认 %s）: ", filepath.Base(path), defaultID))
+		id, err := promptLine(r, fmt.Sprintf("[%s] 游戏标识（留空使用 %s）: ", filepath.Base(path), defaultID))
 		if err != nil {
 			return cfg, err
 		}
 		if id == "" {
 			id = defaultID
 		}
-		label, err := promptLine(r, fmt.Sprintf("[%s] 显示名称（默认 %s）: ", filepath.Base(path), id))
-		if err != nil {
-			return cfg, err
-		}
-		if label == "" {
-			label = id
-		}
+		// 用户界面只保留一个“游戏标识”；Label 与 GameID 使用同一个值，
+		// 以兼容现有 GPBIN4 制品的两个字段。
 		cfg.IDs[path] = id
-		cfg.Labels[path] = label
+		cfg.Labels[path] = id
 	}
 
 	fmt.Println()
@@ -94,56 +89,23 @@ func collectMergeConfigFrom(r *bufio.Reader, selfPath string) (mergeConfig, erro
 		cfg.Output = abs
 	}
 
-	found := cliutil.FindBinary(selfPath, "", cliutil.UpgraderCandidates)
-	defaultUp := found
-	custom, err := promptLine(r, fmt.Sprintf("升级工具基础程序（默认 %s）: ", describeDefault(defaultUp, "自动查找")))
-	if err != nil {
-		return cfg, err
-	}
-	if custom != "" {
-		abs, err := resolveExistingFile(custom, "升级工具")
-		if err != nil {
-			return cfg, err
-		}
-		cfg.Upgrader = abs
-	}
-
-	restorerFound := cliutil.FindBinary(selfPath, "", cliutil.RestorerCandidates)
-	customRestorer, err := promptLine(r, fmt.Sprintf("恢复工具（默认 %s，输入 - 表示不内嵌）: ", describeDefault(restorerFound, "无")))
-	if err != nil {
-		return cfg, err
-	}
-	switch customRestorer {
-	case "-":
-		cfg.Restorer = ""
-	case "":
-		cfg.Restorer = restorerFound
-	default:
-		abs, err := resolveExistingFile(customRestorer, "恢复工具")
-		if err != nil {
-			return cfg, err
-		}
-		cfg.Restorer = abs
-	}
+	// 四个工具通常位于同一目录；交互模式不再询问基座/恢复工具路径，
+	// 执行阶段会自动查找。命令模式仍可用 -upgrader / -restorer 覆盖。
+	cfg.Upgrader = cliutil.FindBinary(selfPath, "", cliutil.UpgraderCandidates)
+	cfg.Restorer = cliutil.FindBinary(selfPath, "", cliutil.RestorerCandidates)
 
 	fmt.Println()
 	fmt.Println("--- 确认 ---")
 	for i, path := range cfg.Inputs {
-		fmt.Printf("  %d) %s  [标识 %s / 名称 %s]\n", i+1, path, cfg.IDs[path], cfg.Labels[path])
+		fmt.Printf("  %d) %s  [标识 %s]\n", i+1, path, cfg.IDs[path])
 	}
 	fmt.Printf("  输出: %s\n", cfg.Output)
-	fmt.Printf("  升级工具: %s\n", describeDefault(cfg.Upgrader, "自动查找"))
-	if cfg.Restorer == "" {
-		fmt.Println("  恢复工具: 不内嵌")
-	} else {
-		fmt.Printf("  恢复工具: %s\n", cfg.Restorer)
-	}
 
-	confirm, err := promptLine(r, "确认合并? (y/N): ")
+	confirm, err := promptConfirm(r, "确认合并? (Y/n): ")
 	if err != nil {
 		return cfg, err
 	}
-	if !strings.EqualFold(strings.TrimSpace(confirm), "y") {
+	if !confirm {
 		return cfg, fmt.Errorf("已取消")
 	}
 	cfg.SelfPath = selfPath
@@ -157,6 +119,19 @@ func describeDefault(value, fallback string) string {
 	return filepath.Base(value)
 }
 
+// promptConfirm 读取 Y/n 确认；空输入或 EOF 都按默认 Yes 处理。
+func promptConfirm(r *bufio.Reader, prompt string) (bool, error) {
+	fmt.Print(prompt)
+	line, err := r.ReadString('\n')
+	line = cliutil.CleanPath(line)
+	if err != nil && line == "" {
+		if err.Error() == "EOF" {
+			return true, nil
+		}
+		return false, err
+	}
+	return !strings.EqualFold(strings.TrimSpace(line), "n"), nil
+}
 func promptLine(r *bufio.Reader, prompt string) (string, error) {
 	fmt.Print(prompt)
 	line, err := r.ReadString('\n')

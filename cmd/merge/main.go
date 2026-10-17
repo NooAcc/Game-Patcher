@@ -42,9 +42,8 @@ func run(args []string) int {
 	upgraderFlag := fs.String("upgrader", "", "升级工具基础程序路径（默认: 自动查找）")
 	restorerFlag := fs.String("restorer", "", "恢复工具二进制路径（默认: 自动查找）")
 	shellMode := fs.Bool("shell", false, "进入交互模式（无参数双击时默认进入）")
-	var ids, labels stringList
-	fs.Var(&ids, "id", "指定游戏标识，格式 <补丁路径>=<标识>（可重复）")
-	fs.Var(&labels, "label", "指定显示名称，格式 <补丁路径>=<名称>（可重复）")
+	var names stringList
+	fs.Var(&names, "name", "指定游戏标识，格式 <补丁路径>=<标识>（可重复）")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -65,7 +64,7 @@ func run(args []string) int {
 		return 1
 	}
 
-	cfg, err := commandConfig(selfPath, fs.Args(), *output, *upgraderFlag, *restorerFlag, ids, labels)
+	cfg, err := commandConfig(selfPath, fs.Args(), *output, *upgraderFlag, *restorerFlag, names)
 	if err != nil {
 		handleError(err, false)
 		return 1
@@ -74,7 +73,7 @@ func run(args []string) int {
 }
 
 // commandConfig 把命令行参数归一化成 mergeConfig。
-func commandConfig(selfPath string, inputs []string, output, upgrader, restorer string, ids, labels stringList) (mergeConfig, error) {
+func commandConfig(selfPath string, inputs []string, output, upgrader, restorer string, names stringList) (mergeConfig, error) {
 	cfg := mergeConfig{
 		Inputs:   make([]string, 0, len(inputs)),
 		IDs:      map[string]string{},
@@ -95,25 +94,18 @@ func commandConfig(selfPath string, inputs []string, output, upgrader, restorer 
 		cfg.Inputs = append(cfg.Inputs, abs)
 	}
 
-	applyPairs := func(list stringList, dst map[string]string, what string) error {
-		for _, item := range list {
-			k, v, ok := strings.Cut(item, "=")
-			if !ok {
-				return fmt.Errorf("%s 需要 <补丁路径>=<值> 形式: %q", what, item)
-			}
-			abs, err := filepath.Abs(cliutil.CleanPath(k))
-			if err != nil {
-				return fmt.Errorf("%s 的补丁路径无效: %w", what, err)
-			}
-			dst[abs] = strings.TrimSpace(cliutil.CleanPath(v))
+	for _, item := range names {
+		k, v, ok := strings.Cut(item, "=")
+		if !ok {
+			return cfg, fmt.Errorf("-name 需要 <补丁路径>=<标识> 形式: %q", item)
 		}
-		return nil
-	}
-	if err := applyPairs(ids, cfg.IDs, "-id"); err != nil {
-		return cfg, err
-	}
-	if err := applyPairs(labels, cfg.Labels, "-label"); err != nil {
-		return cfg, err
+		abs, err := filepath.Abs(cliutil.CleanPath(k))
+		if err != nil {
+			return cfg, fmt.Errorf("-name 的补丁路径无效: %w", err)
+		}
+		name := strings.TrimSpace(cliutil.CleanPath(v))
+		cfg.IDs[abs] = name
+		cfg.Labels[abs] = name
 	}
 
 	if output == "" {
@@ -218,7 +210,7 @@ func printUsage(selfPath string) {
 	fmt.Println()
 	fmt.Println("用法:")
 	fmt.Printf("  %s -out <输出> <补丁1> <补丁2> [补丁3...]\n", exe)
-	fmt.Printf("        [-id <补丁>=<游戏标识>]... [-label <补丁>=<名称>]...\n")
+	fmt.Printf("        [-name <补丁>=<游戏标识>]...\n")
 	fmt.Printf("        [-upgrader <升级工具>] [-restorer <恢复工具>]\n")
 	fmt.Println()
 	fmt.Println("交互模式:")
@@ -227,6 +219,7 @@ func printUsage(selfPath string) {
 	fmt.Println()
 	fmt.Println("说明:")
 	fmt.Println("  输入补丁必须是不带版本链的单段补丁（生成时未使用 -prev）。")
+	fmt.Println("  游戏标识可省略；交互模式留空时使用补丁文件名。")
 	fmt.Println("  合并结果会自动识别目标游戏，只应用匹配的那一份。")
 	fmt.Println("  合并补丁不能作为 -prev 使用。")
 }
