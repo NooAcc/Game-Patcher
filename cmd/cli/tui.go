@@ -566,7 +566,7 @@ func (m wizardModel) renderStepBody(width int) string {
 		return tuiLabelStyle.Render("选择适配器") + "\n" + m.adapterList.View()
 	case stepGodotKey:
 		return tuiLabelStyle.Render("Godot PCK AES-256 Key") + "\n" +
-			tuiMutedStyle.Render("留空则跳过；也可以填写包含 64 位 hex key 的文件路径。") + "\n" +
+			tuiMutedStyle.Render("留空则自动尝试从旧 EXE/PCK 发现；也可以填写 64 位 hex key 或包含 key 的文件路径。") + "\n" +
 			m.keyInput.View()
 	case stepOutput:
 		defaultOut := filepath.Join(filepath.Dir(m.selfPath), "game-updater.exe")
@@ -597,7 +597,7 @@ func (m wizardModel) renderSummary(width int) string {
 	if m.adapterName == "godot" {
 		b.WriteString(tuiLabelStyle.Render("Godot Key") + "  ")
 		if m.godotKey == "" {
-			b.WriteString(tuiMutedStyle.Render("未提供（可能在构建时回退 CDC）"))
+			b.WriteString(tuiMutedStyle.Render("未提供（构建时自动尝试发现）"))
 		} else if _, err := os.Stat(m.godotKey); err == nil {
 			b.WriteString(filepath.Base(m.godotKey))
 		} else {

@@ -238,7 +238,7 @@ func TestGodotAdapterBuildReusesUnchangedFiles(t *testing.T) {
 	}
 }
 
-func TestGodotAdapterBuildFallsBackWithoutKey(t *testing.T) {
+func TestGodotAdapterBuildFallsBackWhenBarePCKHasNoDiscoverableKey(t *testing.T) {
 	key := testKey(t)
 	oldFile := buildOldV4Encrypted(t, key, []fileSpec{{path: "a.txt", data: []byte("hello")}})
 	newFile := buildNewV2Plain(t, []fileSpec{{path: "a.txt", data: []byte("hello")}})
@@ -259,7 +259,10 @@ func TestGodotAdapterBuildFallsBackWithoutKey(t *testing.T) {
 		t.Fatalf("build: %v", err)
 	}
 	if got.Accepted {
-		t.Fatalf("expected fallback without key, got %#v", got)
+		t.Fatalf("expected fallback when a bare encrypted PCK has no discoverable key, got %#v", got)
+	}
+	if got.Reason == "" {
+		t.Fatal("fallback reason should explain that key discovery failed")
 	}
 }
 
@@ -290,4 +293,129 @@ func TestGodotAdapterDescription(t *testing.T) {
 	if !ok || d.Description() == "" {
 		t.Fatal("godot adapter should implement Described")
 	}
+}
+
+func TestGodotAdapterBuildsEmbeddedFooterPCK(t *testing.T) {
+	oldFile := appendTestPCKFooter(t, buildNewV2Plain(t, []fileSpec{{path: "a.txt", data: []byte("hello")}}), []byte("MZ-fake-exe-prefix"))
+	newFile := appendTestPCKFooter(t, buildNewV2Plain(t, []fileSpec{{path: "a.txt", data: []byte("WORLD")}}), []byte("MZ-fake-exe-prefix"))
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old.exe")
+	newPath := filepath.Join(dir, "new.exe")
+	if err := os.WriteFile(oldPath, oldFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newPath, newFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := New().Build(adapter.BuildContext{Context: adapter.Context{
+		OldPath: oldPath, NewPath: newPath, RelPath: "game.exe",
+		OldSize: uint64(len(oldFile)), NewSize: uint64(len(newFile)),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Accepted || got.Delta == nil {
+		t.Fatalf("embedded PCK should be accepted: %#v", got)
+	}
+	out := applyOpsForTest(t, oldFile, got.Delta.Ops)
+	pck, err := parsePCK(out, nil)
+	if err != nil {
+		t.Fatalf("parse rebuilt embedded PCK: %v", err)
+	}
+	if len(pck.Entries) != 1 || pck.Entries[0].Path != "a.txt" || string(out[int(pck.Start)+int(pck.FileBase):int(pck.Start)+int(pck.FileBase)+5]) != "WORLD" {
+		t.Fatal("embedded PCK logical content mismatch")
+	}
+	if len(pck.Trailer) < 12 || string(pck.Trailer[len(pck.Trailer)-4:]) != pckMagic {
+		t.Fatalf("embedded trailer not refreshed: %#v", pck.Trailer)
+	}
+	declared := binary.LittleEndian.Uint64(pck.Trailer[len(pck.Trailer)-12 : len(pck.Trailer)-4])
+	if declared != uint64(pck.End-pck.Start) {
+		t.Fatalf("embedded trailer declares %d, want %d", declared, pck.End-pck.Start)
+	}
+}
+
+func TestGodotAdapterDiscoversKeyFromPE(t *testing.T) {
+	key := testKey(t)
+	oldPCK := buildOldV4Encrypted(t, key, []fileSpec{{path: "a.txt", data: []byte("hello")}})
+	newPCK := buildNewV2Plain(t, []fileSpec{{path: "a.txt", data: []byte("hello")}})
+	pe := makeTestPEWithKey(key)
+	oldFile := appendTestPCKFooter(t, oldPCK, pe)
+	newFile := appendTestPCKFooter(t, newPCK, pe)
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old.exe")
+	newPath := filepath.Join(dir, "new.exe")
+	if err := os.WriteFile(oldPath, oldFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newPath, newFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := New().Build(adapter.BuildContext{Context: adapter.Context{
+		OldPath: oldPath, NewPath: newPath, RelPath: "game.exe",
+		OldSize: uint64(len(oldFile)), NewSize: uint64(len(newFile)),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Accepted {
+		t.Fatalf("expected auto key discovery: %#v", got)
+	}
+}
+
+func TestGodotAdapterRejectsEncryptedNewV2Directory(t *testing.T) {
+	key := testKey(t)
+	oldPCK := buildOldV4Encrypted(t, key, []fileSpec{{path: "a.txt", data: []byte("hello")}})
+	newPCK := buildOldV4Encrypted(t, key, []fileSpec{{path: "a.txt", data: []byte("hello")}})
+	pe := makeTestPEWithKey(key)
+	oldFile := appendTestPCKFooter(t, oldPCK, pe)
+	newFile := appendTestPCKFooter(t, newPCK, pe)
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old.exe")
+	newPath := filepath.Join(dir, "new.exe")
+	if err := os.WriteFile(oldPath, oldFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newPath, newFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := New().Build(adapter.BuildContext{Context: adapter.Context{
+		OldPath: oldPath, NewPath: newPath, RelPath: "game.exe",
+		OldSize: uint64(len(oldFile)), NewSize: uint64(len(newFile)),
+		Options: adapter.Options{Values: map[string]string{"godot.key": testKeyHex}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Accepted {
+		t.Fatalf("v4 new PCK must fall back: %#v", got)
+	}
+	if got.Reason == "" {
+		t.Fatal("fallback reason should explain unsupported rewrite")
+	}
+}
+
+func appendTestPCKFooter(t *testing.T, pck, prefix []byte) []byte {
+	t.Helper()
+	out := append(append([]byte(nil), prefix...), pck...)
+	var footer [12]byte
+	binary.LittleEndian.PutUint64(footer[:8], uint64(len(pck)))
+	copy(footer[8:], "GDPC")
+	return append(out, footer[:]...)
+}
+
+// makeTestPEWithKey 构造最小可解析 PE，密钥放在可读数据 section 中。
+func makeTestPEWithKey(key []byte) []byte {
+	b := make([]byte, 0x400)
+	copy(b, "MZ")
+	binary.LittleEndian.PutUint32(b[0x3c:], 0x80)
+	binary.LittleEndian.PutUint16(b[0x86:], 1)
+	binary.LittleEndian.PutUint16(b[0x94:], 0xe0)
+	sec := 0x178
+	copy(b[sec:sec+8], ".rdata")
+	binary.LittleEndian.PutUint32(b[sec+8:], 0x1000)  // VirtualSize
+	binary.LittleEndian.PutUint32(b[sec+12:], 0x1000) // VirtualAddress
+	binary.LittleEndian.PutUint32(b[sec+16:], 0x200)  // SizeOfRawData
+	binary.LittleEndian.PutUint32(b[sec+20:], 0x200)  // PointerToRawData
+	copy(b[0x200:0x200+32], key)
+	return b
 }

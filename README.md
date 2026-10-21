@@ -110,7 +110,7 @@ game-patcher-cli-win64.exe -shell     # 显式进入交互模式
 
 脚本模式必须显式指定 `-adapter <none|名称>`；默认值为 `none`，程序不会自动猜测游戏引擎。
 
-如果游戏 exe 内嵌了 `GDPC` PCK，并且旧 PCK 目录使用标准 Godot AES-256 加密，可在生成补丁时提供 key：
+如果游戏 exe 内嵌了 `GDPC` PCK，并且旧 PCK 目录使用标准 Godot AES-256 加密，可以显式提供 key：
 
 ```bash
 game-patcher-cli-win64.exe -old ./v1 -new ./v2 -out ./updater.exe \
@@ -118,19 +118,34 @@ game-patcher-cli-win64.exe -old ./v1 -new ./v2 -out ./updater.exe \
   -godot-key 01293b8d0b5d4aec182f82456c5e3c2269702c1b527648c4a5c274232b40ad23
 ```
 
-`-godot-key` 也接受包含 64 位 hex key 的文件路径。适配器会：
+`-godot-key` 也接受包含 64 位 hex key 的文件路径。未提供 key 时，适配器会优先扫描
+旧 EXE 的非可执行数据 section（排除 PCK section），再做保守回退扫描；扫描总量上限
+为 256 MiB，并且只有能让旧加密目录完整 MD5 校验通过的 key 才会被采用。
 
-- 解析新旧 PCK 目录；
+适配器会：
+
+- 解析新旧 PCK 目录，支持标准 `[PCK][u64 size]["GDPC"]` 嵌入尾部；
+- 区分逻辑明文大小与物理存储大小；加密成员按 `40 + ceil(size/16)*16` 校验和复用；
+- 校验明文成员与目录 MD5、加密块内部 MD5、成员越界、目录重叠和成员重叠；
 - 按 `path + plaintext MD5 + size` 比较文件；
 - 未变化文件生成 `COPY`，直接复用旧 exe 中的加密/原始 blob；
 - 变化和新增文件才会进入补丁数据；
 - 应用端不需要 key，也不理解 Godot PCK，只执行普通 COPY/LITERAL 操作。
 
-如果游戏不是 Godot、旧 PCK 无法解析、未提供 key、使用第三方保护，或新版 PCK 不是当前支持重写的格式，选择 `godot` 后适配器会拒绝处理，并自动回退现有 CDC 字节级差分。
+支持矩阵与回退边界：
+
+- 可解析并做安全校验：PCK v2/v3/v4、明文目录、加密目录（需 key）。
+- 可重建：**仅 v2、明文目录**；嵌入包的 12 字节尾部会按新 PCK 长度刷新。
+- 新版 v3/v4、新版加密目录会明确拒绝适配器并回退通用 CDC。
+- `SPARSE_BUNDLE`、成员 `REMOVAL` / `DELTA` 和未知 flags 会被拒绝，不会静默误解。
+- 如果游戏不是 Godot、PCK 无法解析、缺少可用 key、使用第三方保护，选择 `godot`
+  后适配器会拒绝处理，并自动回退现有 CDC 字节级差分。
 
 限制：
 
 - 重建后的 exe 可能与官方新版 exe 逐字节不同；游戏必须接受重建后的 PCK。
+- 自动密钥发现是保守的字节候选扫描，不做保护器逆向或动态计算分析；找不到时仍需显式 `-godot-key`。
+- 目录解析上限为 64 MiB / 100 万条目；超出时会拒绝适配器并回退 CDC。
 - 多版本链建议使用“应用补丁后的结果”作为下一次 `-old`，不要直接使用官方新版目录，除非后续版本检测引入逻辑指纹。
 - 实测 `temp` 中的 Godot 测试游戏：补丁 **139.64 MiB -> 13.15 MiB**；应用后 1983/1983 个逻辑文件与官方新版一致。
 

@@ -9,9 +9,7 @@ import (
 	"testing"
 )
 
-const (
-	testKeyHex = "01293b8d0b5d4aec182f82456c5e3c2269702c1b527648c4a5c274232b40ad23"
-)
+const testKeyHex = "01293b8d0b5d4aec182f82456c5e3c2269702c1b527648c4a5c274232b40ad23"
 
 func testKey(t *testing.T) []byte {
 	t.Helper()
@@ -25,8 +23,6 @@ func testKey(t *testing.T) []byte {
 func appendU32(b *bytes.Buffer, v uint32) { _ = binary.Write(b, binary.LittleEndian, v) }
 func appendU64(b *bytes.Buffer, v uint64) { _ = binary.Write(b, binary.LittleEndian, v) }
 
-// appendEntry 按 Godot PCK 目录格式写入一个条目。path 会补 NUL 到 4 字节对齐，
-// 并把补齐后的长度写入 pathLen（与 Godot 导出的实际形态一致）。
 func appendEntry(t *testing.T, b *bytes.Buffer, path string, ofs, size uint64, digest [16]byte, flags uint32) {
 	t.Helper()
 	raw := []byte(path)
@@ -41,50 +37,99 @@ func appendEntry(t *testing.T, b *bytes.Buffer, path string, ofs, size uint64, d
 	appendU32(b, flags)
 }
 
-func directoryBytes(t *testing.T, entries int) []byte {
-	t.Helper()
-	var dir bytes.Buffer
-	for i := 0; i < entries; i++ {
-		path := "a.txt"
-		if i == 1 {
-			path = "dir/b.bin"
-		}
-		digest := md5.Sum([]byte{byte(i), byte(i + 1), byte(i + 2)})
-		appendEntry(t, &dir, path, uint64(i*16), uint64(i+5), digest, 0)
+func encryptedBlob(plain, key, iv []byte) []byte {
+	digest := md5.Sum(plain)
+	padded := append([]byte(nil), plain...)
+	for len(padded)%16 != 0 {
+		padded = append(padded, 0)
 	}
-	return dir.Bytes()
+	block, _ := aes.NewCipher(key)
+	ct := make([]byte, len(padded))
+	cipher.NewCFBEncrypter(block, iv).XORKeyStream(ct, padded)
+	var out bytes.Buffer
+	out.Write(digest[:])
+	_ = binary.Write(&out, binary.LittleEndian, uint64(len(plain)))
+	out.Write(iv)
+	out.Write(ct)
+	return out.Bytes()
 }
 
-func buildV2(t *testing.T) []byte {
+type packFixtureEntry struct {
+	path   string
+	offset uint64
+	size   uint64
+	digest [16]byte
+	flags  uint32
+}
+
+// buildPCKFixture builds a legal v2/v3/v4 pack. v2 puts the directory at
+// 0x60 and data after it; v3/v4 put data at 0x60 and the directory after it.
+func buildPCKFixture(t *testing.T, version, flags uint32, entries []packFixtureEntry, payload []byte, encryptedDir bool, key []byte) []byte {
 	t.Helper()
-	entries := 2
+	var dir bytes.Buffer
+	for _, e := range entries {
+		appendEntry(t, &dir, e.path, e.offset, e.size, e.digest, e.flags)
+	}
 	var b bytes.Buffer
 	b.WriteString("GDPC")
-	appendU32(&b, 2) // pack format version
+	appendU32(&b, version)
 	appendU32(&b, 4)
 	appendU32(&b, 7)
 	appendU32(&b, 2)
-	appendU32(&b, 2) // REL_FILEBASE
-	appendU64(&b, 0x60)
-	for i := 0; i < 16; i++ {
-		appendU32(&b, 0)
+	appendU32(&b, flags)
+	if version == 2 {
+		if flags&packFlagRelFileBase == 0 {
+			t.Fatal("fixture: v2 requires relative file base")
+		}
+		dirSize := dir.Len()
+		if encryptedDir {
+			dirSize = len(encryptedDirectoryBlock(t, dir.Bytes(), key))
+		}
+		fileBase := alignTest16(0x60 + 4 + dirSize)
+		appendU64(&b, uint64(fileBase))
+		for i := 0; i < 16; i++ {
+			appendU32(&b, 0)
+		}
+		appendU32(&b, uint32(len(entries)))
+		if encryptedDir {
+			b.Write(encryptedDirectoryBlock(t, dir.Bytes(), key))
+		} else {
+			b.Write(dir.Bytes())
+		}
+		for b.Len() < fileBase {
+			b.WriteByte(0)
+		}
+		b.Write(payload)
+		return b.Bytes()
 	}
-	appendU32(&b, uint32(entries))
-	b.Write(directoryBytes(t, entries))
+	dirOffset := alignTest16(0x60 + len(payload))
+	appendU64(&b, 0x60)
+	appendU64(&b, uint64(dirOffset))
+	for b.Len() < 0x60 {
+		b.WriteByte(0)
+	}
+	b.Write(payload)
+	for b.Len() < dirOffset {
+		b.WriteByte(0)
+	}
+	appendU32(&b, uint32(len(entries)))
+	if encryptedDir {
+		b.Write(encryptedDirectoryBlock(t, dir.Bytes(), key))
+	} else {
+		b.Write(dir.Bytes())
+	}
 	return b.Bytes()
 }
 
-func buildV4Encrypted(t *testing.T, key []byte) []byte {
+func encryptedDirectoryBlock(t *testing.T, plain, key []byte) []byte {
 	t.Helper()
-	entries := 2
-	dir := directoryBytes(t, entries)
-	var encDir bytes.Buffer
-	digest := md5.Sum(dir)
-	encDir.Write(digest[:])
-	appendU64(&encDir, uint64(len(dir)))
+	var out bytes.Buffer
+	sum := md5.Sum(plain)
+	out.Write(sum[:])
+	appendU64(&out, uint64(len(plain)))
 	iv := []byte("0123456789abcdef")
-	encDir.Write(iv)
-	padded := append([]byte(nil), dir...)
+	out.Write(iv)
+	padded := append([]byte(nil), plain...)
 	for len(padded)%16 != 0 {
 		padded = append(padded, 0)
 	}
@@ -92,27 +137,35 @@ func buildV4Encrypted(t *testing.T, key []byte) []byte {
 	if err != nil {
 		t.Fatalf("aes: %v", err)
 	}
-	stream := cipher.NewCFBEncrypter(block, iv)
 	ct := make([]byte, len(padded))
-	stream.XORKeyStream(ct, padded)
-	encDir.Write(ct)
+	cipher.NewCFBEncrypter(block, iv).XORKeyStream(ct, padded)
+	out.Write(ct)
+	return out.Bytes()
+}
 
-	var b bytes.Buffer
-	b.WriteString("GDPC")
-	appendU32(&b, 4)
-	appendU32(&b, 4)
-	appendU32(&b, 7)
-	appendU32(&b, 2)
-	appendU32(&b, 3) // DIR_ENCRYPTED | REL_FILEBASE
-	appendU64(&b, 0x70)
-	dirOffset := uint64(0x40)
-	appendU64(&b, dirOffset)
-	for b.Len() < int(dirOffset) {
-		b.WriteByte(0)
+func alignTest16(n int) int {
+	if n%16 == 0 {
+		return n
 	}
-	appendU32(&b, uint32(entries))
-	b.Write(encDir.Bytes())
-	return b.Bytes()
+	return n + 16 - n%16
+}
+
+func buildV2(t *testing.T) []byte {
+	t.Helper()
+	payload := []byte("\xa1\xa1\xa1\xa1\xa1\xb2\xb2\xb2\xb2\xb2\xb2")
+	return buildPCKFixture(t, 2, packFlagRelFileBase, []packFixtureEntry{
+		{path: "a.txt", offset: 0, size: 5, digest: md5.Sum(payload[:5])},
+		{path: "dir/b.bin", offset: 5, size: 6, digest: md5.Sum(payload[5:])},
+	}, payload, false, nil)
+}
+
+func buildV4Encrypted(t *testing.T, key []byte) []byte {
+	t.Helper()
+	payload := []byte("\x31\x31\x31\x31\x31\x32\x32\x32\x32\x32\x32")
+	return buildPCKFixture(t, 4, packFlagDirEncrypted|packFlagRelFileBase, []packFixtureEntry{
+		{path: "a.txt", offset: 0, size: 5, digest: md5.Sum(payload[:5])},
+		{path: "dir/b.bin", offset: 5, size: 6, digest: md5.Sum(payload[5:])},
+	}, payload, true, key)
 }
 
 func TestParsePCKV2PlainDirectory(t *testing.T) {
@@ -129,7 +182,7 @@ func TestParsePCKV2PlainDirectory(t *testing.T) {
 	if pck.Entries[0].Path != "a.txt" || pck.Entries[0].Size != 5 || pck.Entries[0].Offset != 0 {
 		t.Fatalf("entry 0 = %#v", pck.Entries[0])
 	}
-	if pck.Entries[1].Path != "dir/b.bin" || pck.Entries[1].Size != 6 || pck.Entries[1].Offset != 16 {
+	if pck.Entries[1].Path != "dir/b.bin" || pck.Entries[1].Size != 6 || pck.Entries[1].Offset != 5 {
 		t.Fatalf("entry 1 = %#v", pck.Entries[1])
 	}
 }

@@ -367,7 +367,7 @@ func printUsage() {
 	fmt.Println("  -adapter 选择引擎适配器：none 禁用（默认），或指定具体适配器名称。")
 	fmt.Println("           unity：UnityFS(.unity3d/bundle) 在解压后的逻辑流上差分并重编码，大幅减小补丁。")
 	fmt.Println("  -godot-key 用于 Godot 加密 PCK：未变化文件直接复用旧 PCK blob，大幅减小补丁。")
-	fmt.Println("  非 Godot、key 缺失或 PCK 自定义保护时会自动回退普通字节差分。")
+	fmt.Println("  非 Godot、key 无法发现或 PCK 自定义保护时会自动回退普通字节差分。")
 	fmt.Printf("平台: %s/%s\n", runtime.GOOS, runtime.GOARCH)
 }
 

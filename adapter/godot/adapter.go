@@ -50,42 +50,44 @@ func (a *Adapter) Build(ctx adapter.BuildContext) (adapter.BuildResult, error) {
 	if err != nil {
 		return adapter.BuildResult{}, err
 	}
-	oldStart, oldOK := detectPCKOffsetBytes(oldData)
-	newStart, newOK := detectPCKOffsetBytes(newData)
-	if !oldOK || !newOK {
-		return adapter.BuildResult{Accepted: false, Reason: "not a Godot PCK"}, nil
-	}
-	if oldStart != newStart {
-		return adapter.BuildResult{Accepted: false, Reason: "old/new PCK offsets differ"}, nil
-	}
-
 	var key []byte
-	if raw := optionValue(ctx.Options, godotKeyOption); raw != "" {
-		key, err = parseHexKey(raw)
-		if err != nil {
-			return adapter.BuildResult{}, err
+	oldPCK, err := parsePCK(oldData, nil)
+	if err != nil && errorsIsKeyRequired(err) {
+		// 密钥仅在旧目录加密时需要；新版目录若加密会在下方显式拒绝。
+		var keyErr error
+		key, keyErr = resolveKey(ctx, oldData, ctx.OldPath)
+		if keyErr != nil {
+			return adapter.BuildResult{Accepted: false, Reason: keyErr.Error()}, nil
 		}
+		oldPCK, err = parsePCK(oldData, key)
 	}
-
-	oldPCK, err := parsePCK(oldData, key)
 	if err != nil {
 		if errorsIsKeyRequired(err) {
 			return adapter.BuildResult{Accepted: false, Reason: "encrypted Godot PCK requires -godot-key"}, nil
 		}
 		return adapter.BuildResult{Accepted: false, Reason: "old PCK parse failed: " + err.Error()}, nil
 	}
+
 	newPCK, err := parsePCK(newData, key)
 	if err != nil {
+		if errorsIsKeyRequired(err) {
+			return adapter.BuildResult{Accepted: false, Reason: "new encrypted Godot PCK directory rewrite is not supported"}, nil
+		}
 		return adapter.BuildResult{Accepted: false, Reason: "new PCK parse failed: " + err.Error()}, nil
 	}
 	if newPCK.Version != 2 {
 		return adapter.BuildResult{Accepted: false, Reason: fmt.Sprintf("new PCK version %d rewrite not supported yet", newPCK.Version)}, nil
 	}
-	if oldStart != oldPCK.Start || newStart != newPCK.Start {
-		return adapter.BuildResult{Accepted: false, Reason: "PCK start mismatch"}, nil
+	if newPCK.Flags&packFlagDirEncrypted != 0 {
+		return adapter.BuildResult{Accepted: false, Reason: "new encrypted Godot PCK directory rewrite is not supported"}, nil
 	}
-
-	prefixOps, ok := buildPrefixOps(oldData[:oldStart], newData[:newStart])
+	if oldPCK.Start != newPCK.Start {
+		return adapter.BuildResult{Accepted: false, Reason: "old/new PCK offsets differ"}, nil
+	}
+	if (len(oldPCK.Trailer) != 0) != (len(newPCK.Trailer) != 0) {
+		return adapter.BuildResult{Accepted: false, Reason: "old/new embedded PCK layouts differ"}, nil
+	}
+	prefixOps, ok := buildPrefixOps(oldData[:oldPCK.Start], newData[:newPCK.Start])
 	if !ok {
 		return adapter.BuildResult{Accepted: false, Reason: "PE prefix sizes differ"}, nil
 	}
@@ -94,7 +96,15 @@ func (a *Adapter) Build(ctx adapter.BuildContext) (adapter.BuildResult, error) {
 		return adapter.BuildResult{Accepted: false, Reason: err.Error()}, nil
 	}
 	ops := append(prefixOps, pckOps...)
-	newSize := uint64(oldStart) + pckSize
+	trailer := append([]byte(nil), newPCK.Trailer...)
+	if len(trailer) != 0 {
+		if len(trailer) < 12 || string(trailer[len(trailer)-4:]) != pckMagic {
+			return adapter.BuildResult{Accepted: false, Reason: "unsupported embedded PCK trailer"}, nil
+		}
+		binary.LittleEndian.PutUint64(trailer[len(trailer)-12:], pckSize)
+		ops = append(ops, adapter.Op{Kind: adapter.OpLiteral, Data: trailer, Length: uint64(len(trailer))})
+	}
+	newSize := uint64(newPCK.Start) + pckSize + uint64(len(trailer))
 	h := blake3.New()
 	written, err := hashOps(h, oldData, ops)
 	if err != nil {
@@ -117,6 +127,17 @@ func (a *Adapter) Build(ctx adapter.BuildContext) (adapter.BuildResult, error) {
 	}, nil
 }
 
+func resolveKey(ctx adapter.BuildContext, oldData []byte, oldPath string) ([]byte, error) {
+	if raw := optionValue(ctx.Options, godotKeyOption); raw != "" {
+		return parseHexKey(raw)
+	}
+	key, err := findGodotKey(oldData, oldPath)
+	if err != nil {
+		return nil, fmt.Errorf("encrypted Godot PCK requires -godot-key or automatic key discovery: %w", err)
+	}
+	return key, nil
+}
+
 func optionValue(opts adapter.Options, key string) string {
 	if opts.Values == nil {
 		return ""
@@ -135,43 +156,32 @@ func detectPCKOffset(path string) (int, bool) {
 		return 0, false
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return 0, false
+	}
 	var head [4096]byte
 	n, _ := f.Read(head[:])
 	if n >= 4 && string(head[:4]) == pckMagic {
 		return 0, true
 	}
-	if n >= 0x40 && head[0] == 'M' && head[1] == 'Z' {
-		e := int(binary.LittleEndian.Uint32(head[0x3c:]))
-		if e >= 0 && e+24 <= n {
-			nsec := int(binary.LittleEndian.Uint16(head[e+6:]))
-			optSize := int(binary.LittleEndian.Uint16(head[e+20:]))
-			secOff := e + 24 + optSize
-			for i := 0; i < nsec; i++ {
-				off := secOff + i*40
-				if off+40 > n {
-					break
-				}
-				name := strings.TrimRight(string(head[off:off+8]), "\x00")
-				if strings.EqualFold(name, "pck") {
-					raw := int(binary.LittleEndian.Uint32(head[off+20:]))
-					if raw >= 0 {
-						if _, err := f.Seek(int64(raw), 0); err == nil {
-							var m [8]byte
-							if _, err := f.Read(m[:]); err == nil {
-								for j := 0; j+4 <= len(m); j++ {
-									if string(m[j:j+4]) == pckMagic {
-										return raw + j, true
-									}
-								}
-							}
-						}
+	if info.Size() >= 12 {
+		var footer [12]byte
+		if _, err := f.ReadAt(footer[:], info.Size()-12); err == nil && string(footer[8:]) == pckMagic {
+			size := binary.LittleEndian.Uint64(footer[:8])
+			if size <= uint64(info.Size()-12) {
+				start := info.Size() - 12 - int64(size)
+				if _, err := f.Seek(start, 0); err == nil {
+					var magic [4]byte
+					if _, err := f.Read(magic[:]); err == nil && string(magic[:]) == pckMagic {
+						return int(start), true
 					}
 				}
 			}
 		}
 	}
 	limit := int64(16 << 20)
-	if info, err := f.Stat(); err == nil && info.Size() < limit {
+	if info.Size() < limit {
 		limit = info.Size()
 	}
 	if _, err := f.Seek(0, 0); err != nil {
@@ -184,17 +194,10 @@ func detectPCKOffset(path string) (int, bool) {
 		if fileOff+want > limit {
 			want = limit - fileOff
 		}
-		n, err := f.Read(buf[:want])
+		n, err := f.ReadAt(buf[:want], fileOff)
 		if n > 0 {
 			if idx := bytes.Index(buf[:n], []byte(pckMagic)); idx >= 0 {
 				return int(fileOff) + idx, true
-			}
-			if n >= 3 {
-				fileOff += int64(n) - 3
-				if _, err := f.Seek(fileOff, 0); err != nil {
-					break
-				}
-				continue
 			}
 		}
 		if err != nil {
@@ -286,7 +289,7 @@ func buildV2PCKOps(oldPCK *pckFile, oldData []byte, newPCK *pckFile, newData []b
 	fileBase := align16U64(0x60 + dirSize)
 	dataOffset := fileBase
 	for i := range planned {
-		planned[i].flags = (planned[i].flags &^ uint32(packFileRemoval|packFileDelta))
+		planned[i].flags &^= packFileRemoval | packFileDelta
 		planned[i].stateOffset = dataOffset - fileBase
 		dataOffset += planned[i].blobLen
 	}
@@ -298,7 +301,7 @@ func buildV2PCKOps(oldPCK *pckFile, oldData []byte, newPCK *pckFile, newData []b
 	}
 	header := append([]byte(nil), newData[newPCK.Start:newPCK.Start+0x60]...)
 	outFileBase := fileBase
-	if newPCK.Version == 2 && newPCK.Flags&packFlagRelFileBase == 0 {
+	if newPCK.Flags&packFlagRelFileBase == 0 {
 		outFileBase = uint64(newPCK.Start) + fileBase
 	}
 	binary.LittleEndian.PutUint64(header[0x18:], outFileBase)
@@ -337,26 +340,24 @@ func buildV2PCKOps(oldPCK *pckFile, oldData []byte, newPCK *pckFile, newData []b
 func oldBlobRange(pck *pckFile, data []byte, e pckEntry) (uint64, uint64, error) {
 	base := uint64(pck.Start) + pck.FileBase
 	abs := base + e.Offset
-	if e.Flags&packFileEncrypted != 0 {
-		if abs+40 > uint64(len(data)) {
-			return 0, 0, fmt.Errorf("old encrypted blob out of range: %s", e.Path)
+	if e.StoredSize == 0 {
+		if e.Flags&packFileEncrypted != 0 {
+			return 0, 0, fmt.Errorf("old encrypted blob has no stored size: %s", e.Path)
 		}
-		plainLen := binary.LittleEndian.Uint64(data[abs+16:])
-		if plainLen != e.Size {
-			return 0, 0, fmt.Errorf("old encrypted blob size mismatch: %s", e.Path)
-		}
-		padded := plainLen
-		if rem := padded % 16; rem != 0 {
-			padded += 16 - rem
-		}
-		total := 40 + padded
-		if abs+total > uint64(len(data)) {
-			return 0, 0, fmt.Errorf("old encrypted blob truncated: %s", e.Path)
-		}
-		return abs, total, nil
+		e.StoredSize = e.Size
 	}
-	if abs+e.Size > uint64(len(data)) {
+	if abs+e.StoredSize > uint64(len(data)) || abs+e.StoredSize < abs {
 		return 0, 0, fmt.Errorf("old blob out of range: %s", e.Path)
+	}
+	if e.Flags&packFileEncrypted != 0 {
+		b, err := readEncryptedBlock(data, abs, uint64(pck.End))
+		if err != nil {
+			return 0, 0, fmt.Errorf("old encrypted blob: %s: %w", e.Path, err)
+		}
+		if b.Size != e.Size || b.MD5 != e.MD5 {
+			return 0, 0, fmt.Errorf("old encrypted blob metadata mismatch: %s", e.Path)
+		}
+		return abs, b.StoredSize, nil
 	}
 	return abs, e.Size, nil
 }
@@ -365,24 +366,16 @@ func newBlob(e pckEntry, data []byte, pck *pckFile) ([]byte, error) {
 	base := uint64(pck.Start) + pck.FileBase
 	abs := base + e.Offset
 	if e.Flags&packFileEncrypted != 0 {
-		if abs+40 > uint64(len(data)) {
-			return nil, fmt.Errorf("new encrypted blob out of range: %s", e.Path)
+		b, err := readEncryptedBlock(data, abs, uint64(pck.End))
+		if err != nil {
+			return nil, fmt.Errorf("new encrypted blob %s: %w", e.Path, err)
 		}
-		plainLen := binary.LittleEndian.Uint64(data[abs+16:])
-		if plainLen != e.Size {
-			return nil, fmt.Errorf("new encrypted blob size mismatch: %s", e.Path)
+		if b.Size != e.Size || b.MD5 != e.MD5 {
+			return nil, fmt.Errorf("new encrypted blob metadata mismatch: %s", e.Path)
 		}
-		padded := plainLen
-		if rem := padded % 16; rem != 0 {
-			padded += 16 - rem
-		}
-		total := 40 + padded
-		if abs+total > uint64(len(data)) {
-			return nil, fmt.Errorf("new encrypted blob truncated: %s", e.Path)
-		}
-		return append([]byte(nil), data[abs:abs+total]...), nil
+		return append([]byte(nil), data[abs:abs+b.StoredSize]...), nil
 	}
-	if abs+e.Size > uint64(len(data)) {
+	if abs+e.Size > uint64(len(data)) || abs+e.Size < abs {
 		return nil, fmt.Errorf("new blob out of range: %s", e.Path)
 	}
 	return append([]byte(nil), data[abs:abs+e.Size]...), nil
@@ -408,7 +401,7 @@ func hashOps(h *blake3.Hasher, oldData []byte, ops []adapter.Op) (uint64, error)
 	for _, op := range ops {
 		switch op.Kind {
 		case adapter.OpCopy:
-			if op.OldOffset+op.Length > uint64(len(oldData)) {
+			if op.OldOffset+op.Length < op.OldOffset || op.OldOffset+op.Length > uint64(len(oldData)) {
 				return 0, fmt.Errorf("copy out of range")
 			}
 			_, _ = h.Write(oldData[op.OldOffset : op.OldOffset+op.Length])
